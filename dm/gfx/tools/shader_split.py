@@ -2622,6 +2622,9 @@ def scan_file(args):
     archive used to end the whole split with nothing written (PR #282: one of Mario Strikers: Battle League's 879 Next Level Games archives). main reports them"""
     try: return scan_file_in(args)
     except (Exception, SystemExit) as e:   # red() is a SystemExit
+        if os.environ.get('DMSH_SPLIT_TRACE') == '1':
+            import traceback
+            traceback.print_exc()
         why = str(e).removeprefix('[RED] ') if isinstance(e, SystemExit) else f'{type(e).__name__}: {e}'
         if not why.lstrip('/').startswith(args[1]): why = f'{args[1]}: {why}'   # most red lines name the file already
         print(f'[RED] {why} (its shaders are left out)', flush=True)
