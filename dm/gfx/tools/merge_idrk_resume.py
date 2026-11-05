@@ -68,16 +68,21 @@ def main():
     if len(old_lookup) != len(old_rows):
         raise ValueError("Duplicate keys in old map")
     new_lookup = {}
+    repeated = 0
     files = sorted(args.parts.glob("*.pkl"))
     for n, path in enumerate(files, 1):
         with path.open("rb") as f:
             keys, _ = pickle.load(f)
         for key in keys:
             if key in new_lookup:
-                raise ValueError(f"Duplicate key in parts: {key}")
+                # Identical shader keys legitimately occur in multiple IDRK entries.
+                # The extraction already deduplicates keys by content identity.
+                repeated += 1
+                continue
             new_lookup[key] = path
         if n % 5000 == 0:
             print(f"Indexed {n} parts, {len(new_lookup)} shaders", flush=True)
+    print(f"Indexed {len(files)} parts: {len(new_lookup)} unique shaders, {repeated} repeated references", flush=True)
     expected = {r[3] for r in rows}
     if len(expected) != len(rows):
         raise ValueError("Duplicate keys in profile map")
