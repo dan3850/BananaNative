@@ -546,19 +546,56 @@ def idrk_shaders(path, label, out):
     as GLSLC compiler outputs (glslc_shaders). One '_DOK0000' container (type KTID 0x20a6a0bb, the engine's system resources; once in system.rdb.bin and once in the update's .bin1) holds 151 bare
     GLSLC outputs without a G2S wrapper, among them 21 shaders the first battle draws. No other entry type holds any. The RDB files are up to 3.8 GB, so they are mapped rather than read,
     and only entries whose data starts with one of those two magics are inflated"""
-    from romfs import mmap
-    with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
-        skipped = 0
-        for a, b, flags in idrk_entries(d):
-            try:
-                if idrk_data(d, a, b, flags, 4) in (b'_S2G', b'_DOK'):
-                    out.extend(glslc_shaders(idrk_data(d, a, b, flags), f'{label}#IDRK@{a:#x}', need=False))
-            except (MemoryError, ValueError) as exc:
+    # Read IDRK records by offset rather than mapping the entire RDB/.fdata.
+    # This matters on 32-bit-limited Android processes: a 2.4 GiB mapping can
+    # exhaust virtual address space even while the device has free RAM.
+    skipped = 0
+    with open(path, 'rb') as f:
+        f.seek(0, 2)
+        total = f.tell()
+        pos = 0
+        while pos + 0x30 <= total:
+            f.seek(pos)
+            header = f.read(0x30)
+            if header[:8] != IDRK:
+                # Look for the next entry in bounded windows; overlap the
+                # eight-byte magic so an entry on a window edge is found.
+                f.seek(pos)
+                chunk = f.read(min(1 << 20, total - pos))
+                at = chunk.find(IDRK, 1)
+                if at < 0:
+                    pos += max(1, len(chunk) - 7)
+                    continue
+                pos += at
+                continue
+            esz, csz = struct.unpack_from('<QQ', header, 8)
+            if esz < 0x30 or csz > esz or pos + esz > total:
+                skipped += 1
+                pos += 8
+                continue
+            data_at = pos + esz - csz
+            flags = struct.unpack_from('<I', header, 0x2c)[0]
+            pos += esz
+            # Avoid materializing an unbounded record; other entries continue.
+            if csz > (64 << 20):
                 skipped += 1
                 if os.environ.get('DMSH_SPLIT_TRACE') == '1':
-                    print(f'[IDRK] skipped entry at {a:#x}: {type(exc).__name__}: {exc}', flush=True)
-        if skipped:
-            print(f'[RED] {label}: {skipped} IDRK entries skipped (incomplete shader extraction)', flush=True)
+                    print(f'[IDRK] oversized stored entry at {data_at:#x}: {csz} bytes', flush=True)
+                continue
+            try:
+                f.seek(data_at)
+                payload = f.read(csz)
+                if len(payload) != csz:
+                    raise ValueError('short IDRK entry')
+                if idrk_data(payload, 0, len(payload), flags, 4) in (b'_S2G', b'_DOK'):
+                    decoded = idrk_data(payload, 0, len(payload), flags)
+                    out.extend(glslc_shaders(decoded, f'{label}#IDRK@{data_at:#x}', need=False))
+            except (MemoryError, ValueError, zlib.error) as exc:
+                skipped += 1
+                if os.environ.get('DMSH_SPLIT_TRACE') == '1':
+                    print(f'[IDRK] skipped entry at {data_at:#x}: {type(exc).__name__}: {exc}', flush=True)
+    if skipped:
+        print(f'[RED] {label}: {skipped} IDRK entries skipped (incomplete shader extraction)', flush=True)
 
 G2S, SPKG = b'_S2G3000', b'SPKG'
 def kt_gz(d):
