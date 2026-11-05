@@ -530,7 +530,14 @@ def idrk_data(d, a, b, flags, head=None):
             r = lz4.block.decompress(d[a:a + cs], uncompressed_size=0x4000)
             if head: return r[:head]
         elif head: return zlib.decompressobj().decompress(d[a:a + min(cs, 1024)], head)
-        else: r = zlib.decompress(d[a:a + cs])
+        else:
+            # Bound each zlib chunk before allocating its output.  The documented
+            # IDRK chunks inflate to <= 16 KiB; reject malformed streams instead
+            # of letting zlib reserve an unbounded buffer.
+            dec = zlib.decompressobj()
+            r = dec.decompress(d[a:a + cs], 1 << 20)
+            if dec.unconsumed_tail or not dec.eof or len(r) > (1 << 20):
+                raise ValueError(f'IDRK zlib chunk exceeds 1 MiB or is incomplete at {a:#x}')
         out.append(r); a += cs
     return b''.join(out)
 
@@ -541,8 +548,17 @@ def idrk_shaders(path, label, out):
     and only entries whose data starts with one of those two magics are inflated"""
     from romfs import mmap
     with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
+        skipped = 0
         for a, b, flags in idrk_entries(d):
-            if idrk_data(d, a, b, flags, 4) in (b'_S2G', b'_DOK'): out.extend(glslc_shaders(idrk_data(d, a, b, flags), f'{label}#IDRK@{a:#x}', need=False))
+            try:
+                if idrk_data(d, a, b, flags, 4) in (b'_S2G', b'_DOK'):
+                    out.extend(glslc_shaders(idrk_data(d, a, b, flags), f'{label}#IDRK@{a:#x}', need=False))
+            except (MemoryError, ValueError) as exc:
+                skipped += 1
+                if os.environ.get('DMSH_SPLIT_TRACE') == '1':
+                    print(f'[IDRK] skipped entry at {a:#x}: {type(exc).__name__}: {exc}', flush=True)
+        if skipped:
+            print(f'[RED] {label}: {skipped} IDRK entries skipped (incomplete shader extraction)', flush=True)
 
 G2S, SPKG = b'_S2G3000', b'SPKG'
 def kt_gz(d):
