@@ -25,6 +25,8 @@ import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -69,8 +71,24 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private AudioDeviceCallback route;
     private boolean routeReady;
 
+    /** Keep Android's navigation buttons and status bar out of the game viewport. */
+    private void immersiveGame() {
+        getWindow().setDecorFitsSystemWindows(false);
+        WindowInsetsController controller = getWindow().getInsetsController();
+        if (controller != null) {
+            controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+            controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        }
+    }
+
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) immersiveGame();
+    }
+
     @Override protected void onCreate(Bundle saved) {
         super.onCreate(saved);
+        immersiveGame();
         // This game's own host (libnxhost_<title ID>.so, with its profile compiled in): a game this APK has no profile for gets a sentence, not a crash
         String id = String.valueOf(getIntent().getStringExtra("title_id"));
         try {
@@ -702,6 +720,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
     @Override protected void onResume() {
         super.onResume();
+        immersiveGame();
         if (!started) return;
         resumedNow = true;
         Native.lifecycle(3);
