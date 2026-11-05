@@ -344,6 +344,13 @@ def glslc_section(d, h, size):
         if typ: continue
         co, ko, kn, cn = struct.unpack_from('<4I', d, s + 0x30)
         if soff + ssz > size or co + cn > ssz or ko + kn > ssz: return None
+        # A corrupted/false-positive GLSLC header can claim multi-gigabyte sections.
+        # Real GPU control sections are small and individual code sections should
+        # not require an allocation larger than 64 MiB during archive scanning.
+        if cn > (64 << 20) or kn > (64 << 20):
+            if os.environ.get('DMSH_SPLIT_TRACE') == '1':
+                print(f'[GLSLC] skipping oversized section at {h:#x}: ctl={cn} code={kn} output={size}', flush=True)
+            return None
         secs.append((d[h + soff + co:h + soff + co + cn], d[h + soff + ko:h + soff + ko + kn]))
     return secs
 
