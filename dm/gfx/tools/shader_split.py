@@ -351,7 +351,14 @@ def glslc_section(d, h, size):
             if os.environ.get('DMSH_SPLIT_TRACE') == '1':
                 print(f'[GLSLC] skipping oversized section at {h:#x}: ctl={cn} code={kn} output={size}', flush=True)
             return None
-        secs.append((d[h + soff + co:h + soff + co + cn], d[h + soff + ko:h + soff + ko + kn]))
+        try:
+            ctl = d[h + soff + co:h + soff + co + cn]
+            code = d[h + soff + ko:h + soff + ko + kn]
+        except MemoryError:
+            if os.environ.get('DMSH_SPLIT_TRACE') == '1':
+                print(f'[GLSLC] allocation failed at {h:#x}: ctl={cn} code={kn}; skipping section', flush=True)
+            return None
+        secs.append((ctl, code))
     return secs
 
 def glslc_program(d, h, size, label):
