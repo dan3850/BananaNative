@@ -6,13 +6,16 @@
 // tessellation's patch size, texel buffers, viewport swizzles other than a y flip
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_capture.h"
 #include "../nvn/nvn_mtl.h"
 #include "../../host/plat/plat.h"
 #include <math.h>
 #include <stdio.h>
+#include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static VkCommandBuffer g_cb; static unsigned g_slot; static int g_prof, g_dyn_filter = 1, g_pass_keep = 1, g_vb_filter = 1;   // g_prof: DM_VK_PROF
 uint64_t vka_n_rp;   // render passes the draws opened (vka_exec.c replay statistics)
@@ -112,8 +115,10 @@ enum { NSLOT = 8, MAXPOOLS = 64 };
 static VkDescriptorPool g_dp[NSLOT][MAXPOOLS]; static int g_ndp[NSLOT], g_cur_dp[NSLOT];
 void vka_dyn_invalidate(void);
 static void drv_memo_reset(void);
+static void rt_dump_flush(unsigned slot);
 void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
+    rt_dump_flush(g_slot);   // this slot's previous submission fence has already completed (vka_exec.c)
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
     drv_memo_reset();   // the last submission's scratch spans go with its fence
     g_prof = VKA_ENV("DM_VK_PROF", 0) != 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1);   // live: from this submission
@@ -155,12 +160,113 @@ static struct {
     uint32_t cnl[8], dnl; VkExtent2D cext[8], dext;      // each attachment's layers and level size (clears in the pass must cover what they would outside it)
     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
+    uint64_t rt_first_fs, rt_last_fs; uint32_t rt_draws;  // DM_VK_RT_CAPTURE_AT: shaders seen inside this pass
 } R;
 // Clears waiting for the pass of their targets (vka_rp_clear), in order: the next draw over the same targets opens its pass with them (loadOp CLEAR, or vkCmdClearAttachments),
 // anything else does them outside a pass first (pc_flush), as before
 enum { NPC = 16 };
 static struct { int n; p_set_rt rt; vka_pclear c[NPC]; } PC;
 static void pc_flush(void) { int n = PC.n; PC.n = 0; for (int i = 0; i < n; i++) vka_clear_outside(&PC.c[i]); }
+
+// DM_VK_RT_CAPTURE_AT=<frame> : copy up to 24 colour attachments from render
+// passes beginning at that game frame. Copy commands are recorded after the
+// pass, while its source image is still valid; pixels are saved only when the
+// submission slot's fence has completed. No mid-pass queue submit or GPU wait.
+// DM_VK_RT_CAPTURE_STRIDE=2 (default) samples every second eligible pass.
+// PNGs and raw GPU bytes live in $DM_TEMP/sky-rt (or $DM_VK_RTDUMP_DIR).
+enum { RTD_MAX = 24, RTD_PER_SLOT = 4 };
+typedef struct {
+    vcap_hbuf hb;
+    uint64_t frame, pass, serial, first_fs, last_fs;
+    uint32_t w, h, level, layer, draws;
+    VkFormat fmt;
+} rt_dump_item;
+static struct { rt_dump_item item[RTD_PER_SLOT]; unsigned n; } rt_dump[NSLOT];
+static uint64_t rt_dump_passes;
+static unsigned rt_dump_count;
+
+static void rt_dump_flush(unsigned slot) {
+    if (!rt_dump[slot].n) return;
+    char dir[640]; const char *base = getenv("DM_VK_RTDUMP_DIR");
+    if (base && *base) snprintf(dir, sizeof dir, "%s", base);
+    else {
+        base = getenv("DM_TEMP");
+        if (base && *base) snprintf(dir, sizeof dir, "%s/sky-rt", base);
+        else dir[0] = 0;
+    }
+    if (dir[0] && mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        VRED_ONCE("rtdump: cannot create %s; set DM_VK_RTDUMP_DIR to a writable folder", dir);
+        dir[0] = 0;
+    }
+    for (unsigned i = 0; i < rt_dump[slot].n; i++) {
+        rt_dump_item *p = &rt_dump[slot].item[i];
+        size_t n = (size_t)p->w * p->h * (size_t)(p->hb.n / ((uint64_t)p->w * p->h)); // the allocated copy's full byte count
+        if (n > (size_t)p->hb.n) n = (size_t)p->hb.n;
+        size_t zero = 0;
+        for (size_t j = 0; j < n; j++) zero += p->hb.p[j] == 0;
+        if (dir[0]) {
+            char stem[900], name[940];
+            snprintf(stem, sizeof stem, "%s/frame-%llu-pass-%llu-serial-%llu", dir,
+                (unsigned long long)p->frame, (unsigned long long)p->pass, (unsigned long long)p->serial);
+            snprintf(name, sizeof name, "%s.bin", stem);
+            FILE *f = fopen(name, "wb");
+            if (f) { fwrite(p->hb.p, 1, n, f); fclose(f); }
+            snprintf(name, sizeof name, "%s.png", stem);
+            int png = vcap_png(name, p->hb.p, p->w, p->h, p->fmt, 0);
+            snprintf(name, sizeof name, "%s.txt", stem);
+            f = fopen(name, "w");
+            if (f) {
+                fprintf(f, "frame=%llu pass=%llu serial=%llu\nsize=%ux%u format=%d level=%u layer=%u\nfirst_fs=%016llx last_fs=%016llx draws=%u\nbytes=%zu zero_bytes=%zu\n",
+                    (unsigned long long)p->frame, (unsigned long long)p->pass, (unsigned long long)p->serial,
+                    p->w, p->h, (int)p->fmt, p->level, p->layer,
+                    (unsigned long long)p->first_fs, (unsigned long long)p->last_fs, p->draws, n, zero);
+                fclose(f);
+            }
+            VLOG("rtdump saved: %s frame=%llu pass=%llu %ux%u fmt=%d first_fs=%016llx last_fs=%016llx zero=%zu/%zu png=%d",
+                stem, (unsigned long long)p->frame, (unsigned long long)p->pass, p->w, p->h, (int)p->fmt,
+                (unsigned long long)p->first_fs, (unsigned long long)p->last_fs, zero, n, png);
+        } else VRED_ONCE("rtdump: DM_TEMP or DM_VK_RTDUMP_DIR is required to save images");
+        vcap_hbuf_free(&p->hb);
+    }
+    rt_dump[slot].n = 0;
+}
+static void rt_dump_pass(void) {
+    int at = VKA_ENV("DM_VK_RT_CAPTURE_AT", 0);
+    if (at <= 0 || vka_frame() < (uint64_t)at || rt_dump_count >= RTD_MAX || !R.rt_draws) return;
+    unsigned stride = (unsigned)VKA_ENV("DM_VK_RT_CAPTURE_STRIDE", 2);
+    if (!stride) stride = 1;
+    uint64_t pass = ++rt_dump_passes;
+    if ((pass - 1) % stride) return;
+    if (rt_dump[g_slot].n == RTD_PER_SLOT) return;
+    for (int i = 0; i < R.nci && rt_dump[g_slot].n < RTD_PER_SLOT && rt_dump_count < RTD_MAX; i++) {
+        vka_img *im = R.cim[i];
+        if (!im || !im->img || !im->inited || im->samples != 1 ||
+            !(im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || im->f.kind >= 3 ||
+            im->f.bw != 1 || im->f.bh != 1 || !im->f.bpb) continue;
+        uint32_t lv = R.clv[i], ly = R.cl0[i];
+        if (lv >= im->levels || ly >= im->layers) continue;
+        uint32_t w = im->w >> lv ? im->w >> lv : 1;
+        uint32_t h = im->h >> lv ? im->h >> lv : 1;
+        if (w < 256 || h < 144) continue;
+        uint64_t bytes = (uint64_t)w * h * im->f.bpb;
+        if (!bytes || bytes > 16ull * 1024 * 1024) continue;
+        rt_dump_item *p = &rt_dump[g_slot].item[rt_dump[g_slot].n];
+        if (!vcap_hbuf_make(&p->hb, bytes)) { VRED_ONCE("rtdump: no staging buffer"); return; }
+        p->frame = vka_frame(); p->pass = pass; p->serial = im->serial;
+        p->w = w; p->h = h; p->fmt = im->f.vk; p->level = lv; p->layer = ly;
+        p->first_fs = R.rt_first_fs; p->last_fs = R.rt_last_fs; p->draws = R.rt_draws;
+        VkBufferImageCopy cp = {0};
+        cp.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, lv, ly, 1};
+        cp.imageExtent = (VkExtent3D){w, h, 1};
+        vk.vkCmdCopyImageToBuffer(g_cb, im->img, VK_IMAGE_LAYOUT_GENERAL, p->hb.b, 1, &cp);
+        vka_barrier(g_cb);
+        rt_dump[g_slot].n++;
+        rt_dump_count++;
+        VLOG("rtdump queued: frame=%llu pass=%llu serial=%llu %ux%u fmt=%d first_fs=%016llx last_fs=%016llx (%u/%u)",
+            (unsigned long long)p->frame, (unsigned long long)p->pass, (unsigned long long)p->serial, w, h, (int)p->fmt,
+            (unsigned long long)p->first_fs, (unsigned long long)p->last_fs, rt_dump_count, RTD_MAX);
+    }
+}
 // The same targets: the same textures and the same views of them (field by field: the records' padding is not compared)
 static int view_same(const view_t *a, const view_t *b) {
     return a->set_levels == b->set_levels && a->set_layers == b->set_layers && a->set_format == b->set_format && (!a->set_levels || (a->base_level == b->base_level && a->nlevels == b->nlevels)) &&
@@ -182,6 +288,7 @@ void vka_rp_end(void) {
     if (!R.on) return;
     vk.vkCmdEndRendering(g_cb);
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
+    rt_dump_pass();
     R.on = 0; vka_tex_feedback(NULL, NULL, 0);
     if (vka_nan_on()) vka_nan_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);
 }
@@ -1179,6 +1286,11 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         }
     }
     PT(7);
+    // Record the fragment shader range used by this render pass for RT dumps.
+    if (VKA_ENV("DM_VK_RT_CAPTURE_AT", 0) > 0) {
+        R.rt_draws++;
+        if (sh[1]) { if (!R.rt_first_fs) R.rt_first_fs = sh[1]->key; R.rt_last_fs = sh[1]->key; }
+    }
     // The draw
     uint32_t inst = (uint32_t)((dw ? dw->instances : di->instances) > 0 ? (dw ? dw->instances : di->instances) : 1), binst = d->b.base_instance;
     if (mesh) {   // count workgroups of the task shader, or of the mesh shader without one (the device's limit per dimension: maxTaskWorkGroupCount / maxMeshWorkGroupCount, 65535 on the Adreno 840)
