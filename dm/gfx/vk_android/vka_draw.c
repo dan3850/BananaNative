@@ -1120,6 +1120,23 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (!mesh) DY_SET1(pr, (uint32_t)(restart), vk.vkCmdSetPrimitiveRestartEnable(g_cb, DY.pr));
     DY.valid = 1;
 
+    // Optional low-volume shader/target sampling for black-sky investigations.
+    // Off by default; logs at most 160 samples, one per 512 executed draws.
+    // Unlike shader-library rebuilding, this only instruments the Android Vulkan replay.
+    if (VKA_ENV("DM_VK_SKY_TRACE", 0)) {
+        static _Atomic unsigned long long sky_draw_seq;
+        static _Atomic unsigned sky_samples;
+        unsigned long long seq = atomic_fetch_add(&sky_draw_seq, 1);
+        if ((seq % 512u) == 0 && atomic_fetch_add(&sky_samples, 1) < 160) {
+            VLOG("skytrace draw=%llu vs=%016llx fs=%016llx task=%016llx mesh=%016llx rt=%u fmt0=%d depth=%d blend0=%d",
+                seq,
+                sh[0] ? (unsigned long long)sh[0]->key : 0ull,
+                sh[4] ? (unsigned long long)sh[4]->key : 0ull,
+                sh[6] ? (unsigned long long)sh[6]->key : 0ull,
+                sh[7] ? (unsigned long long)sh[7]->key : 0ull,
+                R.ncolor, (int)R.cf[0], (int)R.df, (int)d->blend[0].enable);
+        }
+    }
     PT(7);
     // The draw
     uint32_t inst = (uint32_t)((dw ? dw->instances : di->instances) > 0 ? (dw ? dw->instances : di->instances) : 1), binst = d->b.base_instance;
