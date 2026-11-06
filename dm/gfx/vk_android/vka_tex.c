@@ -442,14 +442,22 @@ static vka_img *img_create(const tex_t *t, const vka_fmt *f, uint32_t base) {
 // residency at this shape (a dense one may be made)
 static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int res, int *why, uint64_t *need) {
     const nvn_texdesc *d = &t->d;
-    if (d->target == NVN_TEXTURE_TARGET_BUFFER) { VRED_ONCE("texture buffers are not images yet (first: serial %llu)", (unsigned long long)t->serial); return NULL; }
+    if (d->target == NVN_TEXTURE_TARGET_BUFFER) {
+        // Experimental compatibility for translated shaders declaring these as
+        // sampled 2D images. NVN buffer textures have tightly packed texels.
+        // Keep the previous behavior unless explicitly enabled.
+        if (!VKA_ENV("DM_VK_TBUF_2D", 0) || !t->L.bpb || !d->width || d->height > 1 || d->levels > 1) {
+            VRED_ONCE("texture buffers are not images yet (first: serial %llu)", (unsigned long long)t->serial);
+            return NULL;
+        }
+    }
     vka_img *im = calloc(1, sizeof *im);
     im->serial = t->serial; im->mem = t->mem; im->d = *d; im->L = t->L; im->f = *f; im->refs = 1;
     if (t->pool && pool_sparse(t->pool)) im->vpool = t->pool;
     im->pool = t->pool; im->pfin = nvn_pool_fin(); im->pgen = nvn_pool_live(t->pool, NULL, NULL);   // (the count first: a pool event in between is seen at the next check)
     // 1D and 1D-array textures are one-row 2D / 2D-array images, as nvn_mtl.m makes them: the translator declares every such read as a 2D one (no Dim1D in any DKB module),
     // and Vulkan has no 2D view of a 1D image, so a 1D image read as unbound
-    int is3d = d->target == NVN_TEXTURE_TARGET_3D, is1d = d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY;
+    int is3d = d->target == NVN_TEXTURE_TARGET_3D, is1d = d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY || d->target == NVN_TEXTURE_TARGET_BUFFER;
     im->w = d->width ? d->width : 1; im->h = is1d ? 1 : d->height ? d->height : 1; im->depth = is3d ? (d->depth ? d->depth : 1) : 1;
     im->layers = is3d ? 1 : t->L.layers ? t->L.layers : 1; im->levels = d->levels ? d->levels : 1; im->samples = d->samples > 1 ? (uint32_t)d->samples : 1;
     if (base >= im->levels || is3d) base = 0;
@@ -613,7 +621,13 @@ static int nvn2_sampled_content(const tex_t *t, const vka_fmt *f, unsigned pf, i
 static uint64_t g_nvn2_first[2];   // textures taken from their storage at a first sample (nvn2_sampled_content): [0] with data, [1] storage all zero (tracked from zeros)
 static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int cpuw, int sampled) {   // c: the storage's content as the GPU will see it (t->mem or gw_content's copy)
     const nvn_texdesc *d = &t->d;
-    if (!t->mem || d->samples > 1 || f->kind >= 3 || d->target == NVN_TEXTURE_TARGET_BUFFER) return ST_ZERO;
+    if (!t->mem || d->samples > 1 || f->kind >= 3) return ST_ZERO;
+    if (d->target == NVN_TEXTURE_TARGET_BUFFER) {
+        if (!VKA_ENV("DM_VK_TBUF_2D", 0)) return ST_ZERO;
+        // Buffer textures are linear in guest storage; request an upload
+        // rather than treating their initial contents as a zeroed GPU target.
+        return ST_TRACK;
+    }
     // A sparse virtual pool's texture (nvn_mtl.m tex_from_storage): a sampled one holds what the CPU wrote into the physical pages mapped behind it (streamed textures), read
     // through the page table and uploaded again when its mappings or those pages change (ST_SPARSE); render targets and images are GPU content. Its address is reserved, inaccessible
     // memory where nothing is mapped (no host alias on Android), so mem_any and the other checks below must not read it
