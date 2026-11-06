@@ -27,6 +27,11 @@ import android.view.SurfaceView;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.EditText;
+import android.text.InputFilter;
+import android.text.InputType;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -53,6 +58,37 @@ import java.util.Map;
  */
 public final class GameActivity extends Activity implements SurfaceHolder.Callback, InputManager.InputDeviceListener {
     private static final int KEEP_LOGS = 10;
+    private static volatile GameActivity keyboardActivity;
+
+    /** Called by the host thread via JNI. Null means the user cancelled. */
+    public static String requestKeyboard(String title, String sub, String guide, String initial, int maxChars) {
+        GameActivity activity = keyboardActivity;
+        if (activity == null) return null;
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<String> answer = new AtomicReference<>();
+        activity.runOnUiThread(() -> {
+            if (activity.isFinishing() || activity.isDestroyed()) { done.countDown(); return; }
+            EditText field = new EditText(activity);
+            field.setSingleLine(true);
+            field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+            field.setText(initial == null ? "" : initial);
+            if (maxChars > 0) field.setFilters(new InputFilter[] { new InputFilter.LengthFilter(maxChars) });
+            field.setSelection(field.length());
+            String heading = title != null && !title.isEmpty() ? title : "Digite o texto";
+            String message = guide != null && !guide.isEmpty() ? guide : sub;
+            AlertDialog dialog = new AlertDialog.Builder(activity)
+                .setTitle(heading)
+                .setMessage(message == null || message.isEmpty() ? null : message)
+                .setView(field)
+                .setPositiveButton("Confirmar", (d, which) -> answer.set(field.getText().toString()))
+                .setNegativeButton("Cancelar", (d, which) -> {})
+                .create();
+            dialog.setOnDismissListener(d -> done.countDown());
+            dialog.show();
+        });
+        try { done.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return null; }
+        return answer.get();
+    }
 
     private TextView overlay;
     private TextView tag, fps;   // the build tag (top left) and the frame rate with the other items (top right, Overlay), drawn by the launcher over the game (no GPU work in the host)
@@ -90,6 +126,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     @Override protected void onCreate(Bundle saved) {
         super.onCreate(saved);
+        keyboardActivity = this;
         applyImmersiveMode();
         // This game's own host (libnxhost_<title ID>.so, with its profile compiled in): a game this APK has no profile for gets a sentence, not a crash
         String id = String.valueOf(getIntent().getStringExtra("title_id"));
@@ -540,6 +577,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
      * The game itself is left as it is: onStop has suspended it
      */
     @Override protected void onDestroy() {
+        if (keyboardActivity == this) keyboardActivity = null;
         ui.removeCallbacksAndMessages(null);
         if (inputManager != null) inputManager.unregisterInputDeviceListener(this);
         if (audio != null) {
