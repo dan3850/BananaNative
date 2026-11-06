@@ -648,6 +648,16 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             w->pImageInfo = ii; if (g_prof) { g_ps[4] += cntvct() - ti_; g_ps[5]++; }
             break; }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+            // Diagnostic only: distinguish a missing texel-buffer implementation from
+            // an unbound slot, without creating invalid VkBufferViews.
+            if (VKA_ENV("DM_VK_TBUF_TRACE", 0)) {
+                static _Atomic unsigned tbuf_samples;
+                if (atomic_fetch_add(&tbuf_samples, 1) < 80)
+                    VLOG("tbuftrace shader=%016llx stage=%d binding=%u what=%d tid=%d addr=%llx size=%llu dim=%#x desc=%u",
+                        (unsigned long long)sh->key, st, r[i].binding, (int)r[i].what,
+                        r[i].tid, (unsigned long long)r[i].addr,
+                        (unsigned long long)r[i].size, r[i].dim, r[i].desc);
+            }
             if (r[i].what != VKA_R_NULL) VRED_ONCE("texel buffers are not on Vulkan yet (shader %016llx binding %u): bound as null", (unsigned long long)sh->key, r[i].binding);
             if (!V.null_desc) { VRED_ONCE("a texel buffer binding and no null descriptors: the draw is skipped"); return 0; }
             g_w.bv[k] = VK_NULL_HANDLE; w->pTexelBufferView = &g_w.bv[k];
