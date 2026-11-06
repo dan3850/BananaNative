@@ -11,8 +11,11 @@ int front_screen_max_fps(void) { return 0; }
 int front_screen_variable_refresh(void) { return 0; }
 void front_screen_match(int fps) { (void)fps; }
 void front_progress(const char *title, long done, long total) { (void)done; (void)total; if (title) { static _Atomic int once; if (!atomic_exchange(&once, 1)) LOG("[RED] front end: no progress screen on Android yet (%s)", title); } }
+typedef int (*android_text_input_fn)(const char *, const char *, const char *, const char *, int, char *, int);
+static android_text_input_fn g_android_text_input;
+__attribute__((visibility("default"))) void nxhost_text_input_set(android_text_input_fn fn) { g_android_text_input = fn; }
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
-    (void)title; (void)sub; (void)guide; (void)initial; (void)max_chars; (void)out; (void)out_cap; return -1;   // no window: the caller's no-window path
+    return g_android_text_input ? g_android_text_input(title, sub, guide, initial, max_chars, out, out_cap) : -1;
 }
 int main(int argc, char **argv);
 // The launcher (android/app) calls this on a thread of its own with an 8 MB stack, which is not attached to ART. Heap pointer tagging goes off first: Bionic's malloc hands
