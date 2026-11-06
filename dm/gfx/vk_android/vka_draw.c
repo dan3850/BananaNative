@@ -1128,13 +1128,13 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         static _Atomic unsigned sky_samples;
         unsigned long long seq = atomic_fetch_add(&sky_draw_seq, 1);
         if ((seq % 512u) == 0 && atomic_fetch_add(&sky_samples, 1) < 160) {
-            VLOG("skytrace draw=%llu vs=%016llx fs=%016llx task=%016llx mesh=%016llx rt=%u fmt0=%d depth=%d blend0=%d",
+            VLOG("skytrace draw=%llu vs=%016llx fs=%016llx task=%016llx mesh=%016llx rt=%u fmt0=%d depth=%d",
                 seq,
                 sh[0] ? (unsigned long long)sh[0]->key : 0ull,
-                sh[4] ? (unsigned long long)sh[4]->key : 0ull,
+                sh[1] ? (unsigned long long)sh[1]->key : 0ull,
                 sh[6] ? (unsigned long long)sh[6]->key : 0ull,
                 sh[7] ? (unsigned long long)sh[7]->key : 0ull,
-                R.ncolor, (int)R.cf[0], (int)R.df, (int)d->blend[0].enable);
+                R.ncolor, (int)R.cf[0], (int)R.df);
         }
     }
     PT(7);
