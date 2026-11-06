@@ -15,7 +15,11 @@ typedef int (*android_text_input_fn)(const char *, const char *, const char *, c
 static android_text_input_fn g_android_text_input;
 __attribute__((visibility("default"))) void nxhost_text_input_set(android_text_input_fn fn) { g_android_text_input = fn; }
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
-    return g_android_text_input ? g_android_text_input(title, sub, guide, initial, max_chars, out, out_cap) : -1;
+    LOG("swkbd bridge: entered callback=%p max=%d cap=%d", (void *)g_android_text_input, max_chars, out_cap);
+    if (!g_android_text_input) return -1;
+    int result = g_android_text_input(title, sub, guide, initial, max_chars, out, out_cap);
+    LOG("swkbd bridge: callback returned %d", result);
+    return result;
 }
 int main(int argc, char **argv);
 // The launcher (android/app) calls this on a thread of its own with an 8 MB stack, which is not attached to ART. Heap pointer tagging goes off first: Bionic's malloc hands
