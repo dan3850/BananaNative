@@ -26,6 +26,7 @@ static JavaVM *g_keyboard_vm;
 static jclass g_keyboard_class;
 static jmethodID g_keyboard_method;
 static int android_keyboard(const char *title, const char *sub, const char *guide, const char *initial, int max, char *out, int cap) {
+    __android_log_print(ANDROID_LOG_ERROR, TAG, "swkbd JNI: entry vm=%p class=%p method=%p cap=%d", (void *)g_keyboard_vm, (void *)g_keyboard_class, (void *)g_keyboard_method, cap);
     if (!g_keyboard_vm || !g_keyboard_class || !g_keyboard_method || !out || cap < 1) return -1;
     JNIEnv *env = NULL;
     int attached = 0;
@@ -33,11 +34,14 @@ static int android_keyboard(const char *title, const char *sub, const char *guid
         if ((*g_keyboard_vm)->AttachCurrentThread(g_keyboard_vm, &env, NULL) != JNI_OK) return -1;
         attached = 1;
     }
+    __android_log_print(ANDROID_LOG_ERROR, TAG, "swkbd JNI: attached=%d env=%p", attached, (void *)env);
     jstring a = (*env)->NewStringUTF(env, title ? title : "");
     jstring b = (*env)->NewStringUTF(env, sub ? sub : "");
     jstring c = (*env)->NewStringUTF(env, guide ? guide : "");
     jstring d = (*env)->NewStringUTF(env, initial ? initial : "");
+    __android_log_print(ANDROID_LOG_ERROR, TAG, "swkbd JNI: before Java dialog");
     jstring result = (jstring)(*env)->CallStaticObjectMethod(env, g_keyboard_class, g_keyboard_method, a, b, c, d, (jint)max);
+    __android_log_print(ANDROID_LOG_ERROR, TAG, "swkbd JNI: Java dialog returned");
     int ok = 0;
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
     else if (result) {
@@ -150,6 +154,7 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_start(JNIEnv *env, jclas
         g_keyboard_method = (*env)->GetStaticMethodID(env, g_keyboard_class, "requestKeyboard", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
         if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); g_keyboard_method = NULL; }
     } else if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    fprintf(stderr, "[nxlaunch] swkbd bridge symbol=%p java_method=%p\\n", (void *)nxhost_text_input_set, (void *)g_keyboard_method);
     if (nxhost_text_input_set) nxhost_text_input_set(android_keyboard);
     char *lp = jstr(env, log); int lr = log_open(lp); free(lp);
     if (lr) return -2;
