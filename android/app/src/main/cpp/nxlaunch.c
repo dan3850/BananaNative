@@ -20,6 +20,38 @@
 #define HOST_STACK (8u << 20)   // guest code runs on this thread (main.c guest_main): a deep stack, as the Mac's main thread has
 
 int nxhost_main(int argc, char **argv);
+extern void nxhost_text_input_set(int (*fn)(const char *, const char *, const char *, const char *, int, char *, int));
+#pragma weak nxhost_text_input_set
+static JavaVM *g_keyboard_vm;
+static jclass g_keyboard_class;
+static jmethodID g_keyboard_method;
+static int android_keyboard(const char *title, const char *sub, const char *guide, const char *initial, int max, char *out, int cap) {
+    if (!g_keyboard_vm || !g_keyboard_class || !g_keyboard_method || !out || cap < 1) return -1;
+    JNIEnv *env = NULL;
+    int attached = 0;
+    if ((*g_keyboard_vm)->GetEnv(g_keyboard_vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*g_keyboard_vm)->AttachCurrentThread(g_keyboard_vm, &env, NULL) != JNI_OK) return -1;
+        attached = 1;
+    }
+    jstring a = (*env)->NewStringUTF(env, title ? title : "");
+    jstring b = (*env)->NewStringUTF(env, sub ? sub : "");
+    jstring c = (*env)->NewStringUTF(env, guide ? guide : "");
+    jstring d = (*env)->NewStringUTF(env, initial ? initial : "");
+    jstring result = (jstring)(*env)->CallStaticObjectMethod(env, g_keyboard_class, g_keyboard_method, a, b, c, d, (jint)max);
+    int ok = 0;
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+    else if (result) {
+        const char *s = (*env)->GetStringUTFChars(env, result, NULL);
+        if (s) { snprintf(out, (size_t)cap, "%s", s); (*env)->ReleaseStringUTFChars(env, result, s); ok = 1; }
+        (*env)->DeleteLocalRef(env, result);
+    }
+    if (a) (*env)->DeleteLocalRef(env, a);
+    if (b) (*env)->DeleteLocalRef(env, b);
+    if (c) (*env)->DeleteLocalRef(env, c);
+    if (d) (*env)->DeleteLocalRef(env, d);
+    if (attached) (*g_keyboard_vm)->DetachCurrentThread(g_keyboard_vm);
+    return ok;
+}
 
 // ---- The host's launcher interface: the headers are the host's own, so a signature change there fails here at compile time; every entry point is weak ----
 #include "input_android.h"
@@ -110,6 +142,15 @@ static char *jstr(JNIEnv *env, jstring s) { const char *c = (*env)->GetStringUTF
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_start(JNIEnv *env, jclass cls, jobjectArray args, jobjectArray envs, jstring log, jstring cwd) {
     (void)cls;
     if (atomic_exchange(&g_started, 1)) return -1;
+    (*env)->GetJavaVM(env, &g_keyboard_vm);
+    jclass local = (*env)->FindClass(env, "dev/nxnative/android/GameActivity");
+    if (local) {
+        g_keyboard_class = (jclass)(*env)->NewGlobalRef(env, local);
+        (*env)->DeleteLocalRef(env, local);
+        g_keyboard_method = (*env)->GetStaticMethodID(env, g_keyboard_class, "requestKeyboard", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
+        if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); g_keyboard_method = NULL; }
+    } else if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (nxhost_text_input_set) nxhost_text_input_set(android_keyboard);
     char *lp = jstr(env, log); int lr = log_open(lp); free(lp);
     if (lr) return -2;
     for (jsize i = 0, n = (*env)->GetArrayLength(env, envs); i < n; i++) {   // the build first: every log says which build it came from
