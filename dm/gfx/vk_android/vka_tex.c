@@ -446,7 +446,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
         // Experimental compatibility for translated shaders declaring these as
         // sampled 2D images. NVN buffer textures have tightly packed texels.
         // Keep the previous behavior unless explicitly enabled.
-        if (!VKA_ENV("DM_VK_TBUF_2D", 0) || !t->L.bpb || !d->width || d->height > 1 || d->levels > 1) {
+        if (!VKA_ENV("DM_VK_TBUF_2D", 0) || !t->L.bpb || !d->width || d->height > 1 || d->levels > 1 || d->width > 16384) {
             VRED_ONCE("texture buffers are not images yet (first: serial %llu)", (unsigned long long)t->serial);
             return NULL;
         }
@@ -1655,6 +1655,11 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
         static _Atomic int n; if (!atomic_exchange(&n, 1)) VLOG("a pass samples the texture it renders (serial %llu level %u) through levels %u+%u: sampled through the levels below it", (unsigned long long)im->serial, g_fb_lv[i], l0, nl);
         nl = g_fb_lv[i] - l0; }
     int tgt = v && v->set_target ? v->target : e->t.d.target;
+    // NVN buffer textures are represented as one-row 2D images only in the
+    // opt-in compatibility path. A registration without an explicit target
+    // otherwise asks view_type() for a buffer view and gets no VkImageView.
+    if (im->d.target == NVN_TEXTURE_TARGET_BUFFER && VKA_ENV("DM_VK_TBUF_2D", 0) && tgt == NVN_TEXTURE_TARGET_BUFFER)
+        tgt = NVN_TEXTURE_TARGET_2D;
     VkComponentMapping m = {0};
     if (storage) nl = 1;
     else if (v && v->set_swizzle) m = (VkComponentMapping){swz1(v->swz[0]), swz1(v->swz[1]), swz1(v->swz[2]), swz1(v->swz[3])};
