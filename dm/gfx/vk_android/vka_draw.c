@@ -1139,19 +1139,27 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (!mesh) DY_SET1(pr, (uint32_t)(restart), vk.vkCmdSetPrimitiveRestartEnable(g_cb, DY.pr));
     DY.valid = 1;
 
-    // First occurrences of fragment shaders: the older skytrace samples only
-    // every 512th draw and can entirely miss a short sky/background pass.
+    // Record each unique fragment shader once. A single hashed slot previously
+    // overwrote other shaders on collisions and flooded the 160-entry budget.
     if (VKA_ENV("DM_VK_SKY_FIRST", 0) && sh[1]) {
-        static _Atomic unsigned nfirst;
-        static _Atomic unsigned long long seen[256];
+        static atomic_flag sky_lock = ATOMIC_FLAG_INIT;
+        static uint64_t sky_seen[256];
+        static unsigned sky_nseen;
         uint64_t key = sh[1]->key;
-        unsigned slot = (unsigned)((key ^ (key >> 32)) & 255u);
-        unsigned long long previous = atomic_exchange(&seen[slot], key);
-        if (previous != key && atomic_fetch_add(&nfirst, 1) < 160)
-            VLOG("skyfirst fs=%016llx vs=%016llx rt=%u fmt0=%d depth=%d slot=%u",
+        int first = 0;
+        while (atomic_flag_test_and_set(&sky_lock)) {}
+        unsigned i = 0;
+        for (; i < sky_nseen; ++i) if (sky_seen[i] == key) break;
+        if (i == sky_nseen && sky_nseen < 256) {
+            sky_seen[sky_nseen++] = key;
+            first = sky_nseen <= 160;
+        }
+        atomic_flag_clear(&sky_lock);
+        if (first)
+            VLOG("skyfirst fs=%016llx vs=%016llx rt=%u fmt0=%d depth=%d",
                 (unsigned long long)key,
                 sh[0] ? (unsigned long long)sh[0]->key : 0ull,
-                R.ncolor, (int)R.cf[0], (int)R.df, slot);
+                R.ncolor, (int)R.cf[0], (int)R.df);
     }
     // Optional low-volume shader/target sampling for black-sky investigations.
     // Off by default; logs at most 160 samples, one per 512 executed draws.
