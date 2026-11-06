@@ -628,6 +628,15 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
             if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
                 int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
+                if (tid && VKA_ENV("DM_VK_TBUF_TRACE", 0) && vka_tex_id_target(tid) == NVN_TEXTURE_TARGET_BUFFER) {
+                    static _Atomic unsigned sampled_tbuf_samples;
+                    if (atomic_fetch_add(&sampled_tbuf_samples, 1) < 64) {
+                        char why[320];
+                        vka_tex_id_desc(tid, why, sizeof why);
+                        VLOG("tbuftrace sampled-image shader=%016llx stage=%d binding=%u tid=%d dim=%#x desc=%u (%s)",
+                            (unsigned long long)sh->key, st, r[i].binding, tid, r[i].dim, r[i].desc, why);
+                    }
+                }
                 if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
                 // A 2D texture in a 3D or cube slot: what the game leaves bound where a shader's branch does not sample (DKB's materials keep a 1x1 2D texture in their volume slot 12).
                 // It reads as unbound, zeros, as nvn_mtl.m's zero 3D / zero cube fallback does; noted once. Other mismatches are reported
