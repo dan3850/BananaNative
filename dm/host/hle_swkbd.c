@@ -61,14 +61,18 @@ int g_swkbd_numeric_max = -1;   // ≥0 = this input is a quantity box, value = 
 int (*g_swkbd_unfilter)(void);   // registered by the host (dm_charname_unfilter in hle_charname.c; NULL in unit tests): keyboard requests from the naming panel bypass the game's ASCII typing filter
 typedef int (*swkbd_input_fn)(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap);
 Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
+    LOG("swkbd trace: enter arg=%p out=%p input=%p", arg_, out, (void *)input);
+    if (!arg_ || !out || !input) { LOG("[RED] swkbd trace: null argument"); return SWKBD_RESULT_CANCELED; }
     const uint8_t *arg = arg_;
     char title[HEADER_N * 3 + 1], sub[SUB_N * 3 + 1], guide[GUIDE_N * 3 + 1], init[501 * 3 + 1] = "", text[1002 * 3 + 1];
+    LOG("swkbd trace: decoding title/subtitle/guide");
     swkbd_u16_to_u8((const uint16_t *)(arg + ARG_HEADER), HEADER_N, title, sizeof title);
     swkbd_u16_to_u8((const uint16_t *)(arg + ARG_SUB), SUB_N, sub, sizeof sub);
     swkbd_u16_to_u8((const uint16_t *)(arg + ARG_GUIDE), GUIDE_N, guide, sizeof guide);
     int32_t maxlen, minlen, ilen, ioff; memcpy(&maxlen, arg + ARG_MAXLEN, 4); memcpy(&minlen, arg + ARG_MINLEN, 4); memcpy(&ilen, arg + ARG_INIT_LEN, 4); memcpy(&ioff, arg + ARG_INIT_OFF, 4);
     const uint8_t *work; memcpy(&work, arg + ARG_WORKBUF, 8);
-    if (ilen > 0 && work) swkbd_u16_to_u8((const uint16_t *)(work + ioff), (size_t)ilen, init, sizeof init);
+    LOG("swkbd trace: config max=%d min=%d initial_len=%d initial_off=%d work=%p", maxlen, minlen, ilen, ioff, (void *)work);
+    if (ilen > 0 && work && ilen <= 501 && ioff >= 0 && ioff <= 1048576) swkbd_u16_to_u8((const uint16_t *)(work + ioff), (size_t)ilen, init, sizeof init);
 
     const char *script = getenv("DM_KBD");
     // The guest clock keeps running while the keyboard is up, as on the Switch: the applet blocks the calling thread and the game's other threads go on in real time. d2r-mobile froze it here
@@ -78,7 +82,9 @@ Result swkbd_show(void *out, const void *arg_, swkbd_input_fn input) {
     // Test switch DM_TEST_SWKBD_HOLD_MS=<ms> (with DM_KBD): the keyboard stays up that long before DM_KBD's text is returned, the way a player types into the input box (for reproducing on the Mac what the game's other threads do meanwhile)
     static int hold = -1; if (hold < 0) { const char *h = getenv("DM_TEST_SWKBD_HOLD_MS"); hold = h ? atoi(h) : 0; }
     if (script && hold > 0) usleep((useconds_t)hold * 1000);
+    LOG("swkbd trace: calling frontend scripted=%d", script != NULL);
     int r = script ? (snprintf(text, sizeof text, "%s", script), 1) : (g_swkbd_min_chars = minlen > 0 ? minlen : -1, input(title, sub, guide, init, maxlen > 0 ? maxlen : 0, text, sizeof text));
+    LOG("swkbd trace: frontend returned %d", r);
     g_swkbd_numeric_max = -1;   // the numeric box mark applies to this one time only (set by dm_textinput.c before bringing up the keyboard)
     g_swkbd_min_chars = -1;     // the minimum length applies to this one time only
     LOG("swkbd: title '%s' initial '%s' limit %d min %d → %s%s%s", title, init, maxlen, minlen,
