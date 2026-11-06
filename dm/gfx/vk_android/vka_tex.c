@@ -1792,7 +1792,15 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     if (storage && VKA_ENV("DM_VK_IMG_UPGRADE", 1)) e.t.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;   // bound to an image slot: image intent (img_storage_upgrade)
     pthread_mutex_unlock(&g_tmu);
     nvn_pool_use(1); g_first_sampled = !storage; vka_img *im = treg_dead(id, &e) ? NULL : vka_tex_get(&e.t, cb); g_first_sampled = 0; nvn_pool_use(0);
-    if (!im) return VK_NULL_HANDLE;
+    if (!im) {
+        if (VKA_ENV("DM_VK_TEX_TRACE", 0)) {
+            static _Atomic unsigned n;
+            if (atomic_fetch_add(&n, 1) < 48)
+                VRED("textrace missing image id=%d serial=%llu target=%d dim=%#x storage=%d",
+                    id, (unsigned long long)e.t.serial, (int)e.t.d.target, dim, storage);
+        }
+        return VK_NULL_HANDLE;
+    }
     int vt = dim_view_type(dim);
     if (vt < 0) return VK_NULL_HANDLE;
     if (((dim & DMSH_VK_DIM_MS) != 0) != (im->samples > 1)) return VK_NULL_HANDLE;
@@ -1807,7 +1815,15 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = im->f.kind == 1 ? 1 : im->f.kind == 2 ? 2 : 0;
     if (want != have && !(im->f.kind >= 3 && want == 0)) return VK_NULL_HANDLE;
     if (imo) *imo = im;
-    return view_of(&e, im, vt, storage);
+    VkImageView view = view_of(&e, im, vt, storage);
+    if (!view && VKA_ENV("DM_VK_TEX_TRACE", 0)) {
+        static _Atomic unsigned n;
+        if (atomic_fetch_add(&n, 1) < 64)
+            VRED("textrace missing view id=%d serial=%llu target=%d dim=%#x vt=%d img=%ux%u layers=%u storage=%d",
+                id, (unsigned long long)e.t.serial, (int)e.t.d.target, dim, vt,
+                im->w, im->h, im->layers, storage);
+    }
+    return view;
 }
 vka_img *vka_tex_id_img(int id, VkCommandBuffer cb) {   // the image of texture ID id (DM_VK_NANSCAN), NULL = none
     pthread_mutex_lock(&g_tmu);
