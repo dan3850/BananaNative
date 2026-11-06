@@ -160,7 +160,7 @@ static struct {
     uint32_t cnl[8], dnl; VkExtent2D cext[8], dext;      // each attachment's layers and level size (clears in the pass must cover what they would outside it)
     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
-    uint64_t rt_first_fs, rt_last_fs; uint32_t rt_draws;  // DM_VK_RT_CAPTURE_AT: shaders seen inside this pass
+    uint64_t rt_first_fs, rt_last_fs, rt_fs[12]; uint32_t rt_draws, rt_nfs;  // DM_VK_RT_CAPTURE_AT: shaders seen inside this pass
 } R;
 // Clears waiting for the pass of their targets (vka_rp_clear), in order: the next draw over the same targets opens its pass with them (loadOp CLEAR, or vkCmdClearAttachments),
 // anything else does them outside a pass first (pc_flush), as before
@@ -177,8 +177,8 @@ static void pc_flush(void) { int n = PC.n; PC.n = 0; for (int i = 0; i < n; i++)
 enum { RTD_MAX = 24, RTD_PER_SLOT = 4 };
 typedef struct {
     vcap_hbuf hb;
-    uint64_t frame, pass, serial, first_fs, last_fs;
-    uint32_t w, h, level, layer, draws;
+    uint64_t frame, pass, serial, first_fs, last_fs, fs[12];
+    uint32_t w, h, level, layer, draws, nfs;
     VkFormat fmt;
 } rt_dump_item;
 static struct { rt_dump_item item[RTD_PER_SLOT]; unsigned n; } rt_dump[NSLOT];
@@ -200,8 +200,7 @@ static void rt_dump_flush(unsigned slot) {
     }
     for (unsigned i = 0; i < rt_dump[slot].n; i++) {
         rt_dump_item *p = &rt_dump[slot].item[i];
-        size_t n = (size_t)p->w * p->h * (size_t)(p->hb.n / ((uint64_t)p->w * p->h)); // the allocated copy's full byte count
-        if (n > (size_t)p->hb.n) n = (size_t)p->hb.n;
+        size_t n = (size_t)p->hb.n;  // vcap_hbuf_make allocates exactly the packed image bytes
         size_t zero = 0;
         for (size_t j = 0; j < n; j++) zero += p->hb.p[j] == 0;
         if (dir[0]) {
@@ -220,6 +219,9 @@ static void rt_dump_flush(unsigned slot) {
                     (unsigned long long)p->frame, (unsigned long long)p->pass, (unsigned long long)p->serial,
                     p->w, p->h, (int)p->fmt, p->level, p->layer,
                     (unsigned long long)p->first_fs, (unsigned long long)p->last_fs, p->draws, n, zero);
+                fprintf(f, "fragment_shaders=");
+                for (uint32_t j = 0; j < p->nfs; j++) fprintf(f, "%s%016llx", j ? "," : "", (unsigned long long)p->fs[j]);
+                fprintf(f, "\n");
                 fclose(f);
             }
             VLOG("rtdump saved: %s frame=%llu pass=%llu %ux%u fmt=%d first_fs=%016llx last_fs=%016llx zero=%zu/%zu png=%d",
@@ -255,6 +257,7 @@ static void rt_dump_pass(void) {
         p->frame = vka_frame(); p->pass = pass; p->serial = im->serial;
         p->w = w; p->h = h; p->fmt = im->f.vk; p->level = lv; p->layer = ly;
         p->first_fs = R.rt_first_fs; p->last_fs = R.rt_last_fs; p->draws = R.rt_draws;
+        p->nfs = R.rt_nfs; memcpy(p->fs, R.rt_fs, (size_t)p->nfs * sizeof *p->fs);
         VkBufferImageCopy cp = {0};
         cp.imageSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, lv, ly, 1};
         cp.imageExtent = (VkExtent3D){w, h, 1};
@@ -1289,7 +1292,13 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     // Record the fragment shader range used by this render pass for RT dumps.
     if (VKA_ENV("DM_VK_RT_CAPTURE_AT", 0) > 0) {
         R.rt_draws++;
-        if (sh[1]) { if (!R.rt_first_fs) R.rt_first_fs = sh[1]->key; R.rt_last_fs = sh[1]->key; }
+        if (sh[1]) {
+            uint64_t key = sh[1]->key;
+            if (!R.rt_first_fs) R.rt_first_fs = key;
+            R.rt_last_fs = key;
+            uint32_t j = 0; for (; j < R.rt_nfs; j++) if (R.rt_fs[j] == key) break;
+            if (j == R.rt_nfs && R.rt_nfs < 12) R.rt_fs[R.rt_nfs++] = key;
+        }
     }
     // The draw
     uint32_t inst = (uint32_t)((dw ? dw->instances : di->instances) > 0 ? (dw ? dw->instances : di->instances) : 1), binst = d->b.base_instance;
