@@ -172,7 +172,7 @@ static void pc_flush(void) { int n = PC.n; PC.n = 0; for (int i = 0; i < n; i++)
 // passes beginning at that game frame. Copy commands are recorded after the
 // pass, while its source image is still valid; pixels are saved only when the
 // submission slot's fence has completed. No mid-pass queue submit or GPU wait.
-// DM_VK_RT_CAPTURE_STRIDE=2 (default) samples every second eligible pass.
+// DM_VK_RT_CAPTURE_SKIP=12 skips the first twelve drawing passes after the\n// capture starts, to reach late composition passes. DM_VK_RT_CAPTURE_STRIDE=2\n// (default) samples every second eligible pass after that offset.
 // PNGs and raw GPU bytes live in $DM_TEMP/sky-rt (or $DM_VK_RTDUMP_DIR).
 enum { RTD_MAX = 24, RTD_PER_SLOT = 4 };
 typedef struct {
@@ -238,7 +238,7 @@ static void rt_dump_pass(void) {
     unsigned stride = (unsigned)VKA_ENV("DM_VK_RT_CAPTURE_STRIDE", 2);
     if (!stride) stride = 1;
     uint64_t pass = ++rt_dump_passes;
-    if ((pass - 1) % stride) return;
+    int skip = VKA_ENV("DM_VK_RT_CAPTURE_SKIP", 0);\n    if (skip < 0) skip = 0;\n    if (VKA_ENV("DM_VK_RT_CAPTURE_LOG", 0) && pass <= 96) {\n        vka_img *im = R.nci ? R.cim[0] : NULL;\n        VLOG("rtdump pass-info frame=%llu pass=%llu rt=%u area=%ux%u first_serial=%llu size=%ux%u draws=%u fs=%016llx..%016llx",\n            (unsigned long long)vka_frame(), (unsigned long long)pass, R.nci, R.area.extent.width, R.area.extent.height,\n            (unsigned long long)(im ? im->serial : 0), im ? im->w : 0, im ? im->h : 0, R.rt_draws,\n            (unsigned long long)R.rt_first_fs, (unsigned long long)R.rt_last_fs);\n    }\n    if (pass <= (uint64_t)skip || ((pass - (uint64_t)skip - 1) % stride)) return;
     if (rt_dump[g_slot].n == RTD_PER_SLOT) return;
     for (int i = 0; i < R.nci && rt_dump[g_slot].n < RTD_PER_SLOT && rt_dump_count < RTD_MAX; i++) {
         vka_img *im = R.cim[i];
