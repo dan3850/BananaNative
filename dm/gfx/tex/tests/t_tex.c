@@ -43,6 +43,23 @@ static void roundtrip(const char *tag, int target, int fmt, uint32_t w, uint32_t
         memset(out, 0x5A, n);
         for (uint32_t p = 0; p < 3; p++) CHECK(!nvn_deswizzle_rows(&d, l, y, st, out, rb, rows * p / 3, rows * (p + 1) / 3), "%s part decode failed", tag);
         if (memcmp(out, ref[y][l], n)) { ok = 0; printf("  ✗ %s layer %u level %u decoded in parts differs\n", tag, y, l); }
+        // The Android replay prepares level/layer geometry once, then shares
+        // its immutable data with all 64-KiB row jobs. Check those rows are
+        // byte-identical to the original whole-level round trip for EVERY
+        // texture target / mip / layer exercised here (including 3D).
+        nvn_deswizzle_ctx geo;
+        int prepared = nvn_deswizzle_prepare(&d, l, y, &geo);
+        CHECK(!prepared, "%s level %u layer %u: prepared geometry failed", tag, l, y);
+        if (!prepared) {
+            memset(out, 0x5A, n);
+            for (uint32_t p = 0; p < 3; p++)
+                CHECK(!nvn_deswizzle_rows_prepared(&geo, st, out, rb, rows * p / 3, rows * (p + 1) / 3),
+                      "%s level %u layer %u: prepared slice %u failed", tag, l, y, p);
+            if (memcmp(out, ref[y][l], n)) {
+                ok = 0;
+                printf("  ✗ %s layer %u level %u prepared slices differ from original\n", tag, y, l);
+            }
+        }
         bytes += n; free(out); free(ref[y][l]);
     }
     checks++; if (!ok) fails++;
