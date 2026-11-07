@@ -61,6 +61,21 @@ void mtl_set_frame(uint64_t f) {
           vka_floor_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb);
           vka_rp_bar_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
           { void vka_drv_memo_stats(char *b, size_t n); vka_drv_memo_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb); } }
+        // Count actual Vulkan draw/dispatch calls rejected in this interval,
+        // not just the generic pool-warning that a range might be split.
+        // One draw/dispatch with missing descriptors increments 'skipped';
+        // a truncated SSBO may still draw and is traced by segtrace separately.
+        {
+            static uint64_t last_drawn, last_refused;
+            uint64_t drawn = 0, refused = 0;
+            vka_draw_stats(&drawn, &refused, NULL, NULL);
+            int at = VKA_ENV("DM_VK_SEG_TRACE_AT", 0);
+            if (at > 0 && f >= (uint64_t)at)
+                VLOG("segtrace interval through frame %llu: executed=%llu skipped=%llu (graphics+compute; since last stats)",
+                    (unsigned long long)f, (unsigned long long)(drawn - last_drawn),
+                    (unsigned long long)(refused - last_refused));
+            last_drawn = drawn; last_refused = refused;
+        }
         f0 = f; d0 = g_stat_draws; rp0 = vka_n_rp; b0 = vka_n_bar; ub0 = g_n_ub; s0 = g_n_sub; r0 = g_rec_ns; o0 = g_stat_ops; pc0 = g_n_pclear; ch0 = g_n_chunks;
     }
 }
