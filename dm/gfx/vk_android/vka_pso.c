@@ -869,7 +869,61 @@ static void *pw_main(void *a) {
              (unsigned)atomic_load(&g_pw_had), (unsigned)atomic_load(&g_pw_bad), atomic_load(&g_pw_wait_ns) / 1e6);
     return NULL;
 }
+// Pokopia's Poke Ball opening has three compute pipelines that took ~30 s
+// each to compile on an uncached Adreno 840. The recorded-key prewarm cannot
+// help after Clear data: vk_pipelines.keys is then empty. Seed only these
+// observed compute keys as soon as the *first* Vulkan pipeline is requested,
+// on a low-priority worker. Unlike async dispatch skipping, every dispatch
+// still executes: if the worker is late, cs_obtain waits for the same pipeline.
+// No translation or shader library is changed by this prewarm.
+static void *pw_pokopia_cold_main(void *unused) {
+    (void)unused; pthread_setname_np(pthread_self(), "vk-pokopia-cs");
+    setpriority(PRIO_PROCESS, 0, 10);
+    const uint64_t keys[] = {
+        0x19391de31e77a42bull,
+        0x6bef3d23a8ddeafdull,
+        0x4fb03a033366f0b2ull
+    };
+    int prepared = 0, unavailable = 0;
+    uint64_t all = now_ns();
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        pause_point();
+        uint64_t t = now_ns();
+        vka_shader *cs = vka_shader_by_key(keys[i]);
+        if (!cs || !cs->e || cs->e->stage != DMSH_VK_STAGE_CS) {
+            unavailable++;
+            VLOG("Pokopia cold compute prewarm: shader %016llx unavailable in loaded shader libraries", (unsigned long long)keys[i]);
+            continue;
+        }
+        vka_shader *sh[VKA_NSTAGE] = {0}; sh[5] = cs;
+        vka_layout lay;
+        if (!vka_layout_of(sh, 1, &lay)) {
+            unavailable++;
+            VLOG("Pokopia cold compute prewarm: shader %016llx has no compatible pipeline layout", (unsigned long long)keys[i]);
+            continue;
+        }
+        int made = 0;
+        VkPipeline p = cs_obtain(cs, &lay, 1, &made);
+        double ms = (now_ns() - t) / 1e6;
+        VLOG("Pokopia cold compute prewarm: %016llx %s in %.0f ms%s", (unsigned long long)keys[i],
+             p ? "ready" : "failed", ms, made ? "" : " (already cached or in progress)");
+        if (p) prepared++; else unavailable++;
+        setpriority(PRIO_PROCESS, 0, 10);
+    }
+    VLOG("Pokopia cold compute prewarm: %d of 3 ready, %d unavailable, %.1f seconds total; normal dispatches remain enabled",
+         prepared, unavailable, (now_ns() - all) / 1e9);
+    return NULL;
+}
 static void pw_start(void) {
+    // This seed deliberately does not depend on vk_pipelines.keys: it also
+    // works on a first launch with no cache. An opt-out is available for A/B.
+    if (!strcmp(DM_GAME_ID, "0400A3A01EE4C000") && VKA_ENV("DM_VK_POKOPIA_COLD_PREWARM", 1)) {
+        pthread_t cold;
+        if (!pthread_create(&cold, NULL, pw_pokopia_cold_main, NULL)) {
+            pthread_detach(cold);
+            VLOG("Pokopia cold compute prewarm: started 3 shader jobs in the background before their first dispatch");
+        } else VRED("Pokopia cold compute prewarm: background thread not started");
+    }
     int nt = VKA_ENV("DM_VK_PREWARM", 2);
     if (nt <= 0 || !g_pw_load_n) { if (g_pw_load_n) VLOG("prewarm: off (DM_VK_PREWARM=0): %u keys not made ahead", g_pw_load_n); return; }
     if (nt > 4) nt = 4;
