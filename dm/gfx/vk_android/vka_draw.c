@@ -589,20 +589,46 @@ static int cpu_read(uint64_t addr, void *out, size_t n) {   // guest bytes as th
 }
 static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; return cpu_read(addr, out, n); }
 // A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
-static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
+// Optional bounded trace of actual descriptor ranges that cross segment
+// boundaries. Unlike the pool placement warning this identifies a shader and
+// binding that really uses only a partial Vulkan buffer.
+static void segtrace(const char *kind, uint64_t key, int st, uint32_t binding, uint64_t addr, uint64_t need, uint64_t run) {
+    int at = VKA_ENV("DM_VK_SEG_TRACE_AT", 0);
+    if (at <= 0 || vka_frame() < (uint64_t)at || (need && run >= need)) return;
+    static _Atomic unsigned n;
+    if (atomic_fetch_add(&n, 1) < 48)
+        VLOG("segtrace %s frame=%llu shader=%016llx stage=%d binding=%u addr=%#llx need=%llu first_segment=%llu",
+            kind, (unsigned long long)vka_frame(), (unsigned long long)key,
+            st, binding, (unsigned long long)addr,
+            (unsigned long long)need, (unsigned long long)run);
+}
+// A uniform buffer must provide all bytes requested. A shorter VkBuffer range
+// silently feeds only the first segment and loses trailing constants. When a
+// range straddles placed segments, use the existing CPU scratch fallback, with
+// its known limitation for GPU writes inside the same submission.
+static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi,
+                    uint64_t shader, int stage, uint32_t binding) {
     if (!size || size > V.ub_range) size = size ? V.ub_range : 65536 < V.ub_range ? 65536 : V.ub_range;
     VkBuffer b; VkDeviceSize o;
     uint64_t run = vka_addr_run(addr, size, &b, &o);
-    if (run && !(o % V.ub_align) && !(addr % V.ub_align)) { *bi = (VkDescriptorBufferInfo){b, o, run}; return 1; }
+    if (run < size) segtrace("UBO-partial-copy", shader, stage, binding, addr, size, run);
+    if (run == size && !(o % V.ub_align) && !(addr % V.ub_align)) {
+        *bi = (VkDescriptorBufferInfo){b, o, size}; return 1;
+    }
     vka_span s; if (!vka_scratch(size, V.ub_align, &s)) return 0;
     if (!cpu_read(addr, s.ptr, size)) { memset(s.ptr, 0, size); VRED_ONCE("uniform buffer at %#llx is not readable: it reads zeros", (unsigned long long)addr); }
-    else if (run) VRED_ONCE("uniform buffer at %#llx is not %llu-byte aligned: bound as a copy of the CPU's bytes", (unsigned long long)addr, (unsigned long long)V.ub_align);
+    else if (run == size) VRED_ONCE("uniform buffer at %#llx is not %llu-byte aligned: bound as a copy of the CPU's bytes", (unsigned long long)addr, (unsigned long long)V.ub_align);
+    else if (run) VRED_ONCE("uniform buffer at %#llx crosses placed Vulkan segments: bound as a full CPU copy (GPU writes within this submission may not be visible)", (unsigned long long)addr);
     else VRED_ONCE("uniform buffer at %#llx is not in placed guest RAM: bound as a copy of the CPU's bytes", (unsigned long long)addr);
     *bi = (VkDescriptorBufferInfo){s.buf, s.off, size}; return 1;
 }
-static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
+static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi,
+                     uint64_t shader, int stage, uint32_t binding) {
     VkBuffer b; VkDeviceSize o;
-    uint64_t run = vka_addr_run(addr, size ? size : V.sb_range, &b, &o);
+    uint64_t need = size ? size : V.sb_range;
+    uint64_t run = vka_addr_run(addr, need, &b, &o);
+    if (size && run < size && size <= V.sb_range)
+        segtrace("SSBO-truncated", shader, stage, binding, addr, size, run);
     if (!run) { VRED_ONCE("storage buffer at %#llx is not in placed guest RAM: it is not bound", (unsigned long long)addr); return 0; }
     if (run > V.sb_range) run = V.sb_range;
     *bi = (VkDescriptorBufferInfo){b, o, run}; return 1;
@@ -758,7 +784,9 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             switch (r[i].what) {
-            case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
+            case VKA_R_BUF: ok = storage
+                ? ssbo_desc(r[i].addr, r[i].size, bi, sh->key, st, r[i].binding)
+                : ubo_desc(r[i].addr, r[i].size, bi, sh->key, st, r[i].binding);
                 if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
                 break;
             case VKA_R_C1: if (sh->c1_len) *bi = (VkDescriptorBufferInfo){sh->c1.buf, sh->c1.off, (sh->c1_len + 15) & ~(VkDeviceSize)15}; else ok = 0; break;
