@@ -989,7 +989,8 @@ static void pw_start(void) {
     VLOG("prewarm: %u pipeline keys of earlier runs made ahead on %d background threads (DM_VK_PREWARM=0 off)", g_pw_load_n, g_pw_threads);
 }
 
-// Optional, reversible async graphics experiment (DM_VK_GFX_ASYNC=1).
+// Reversible async graphics experiment (automatic for Pokopia on the verified Adreno
+// driver, otherwise opt-in through DM_VK_GFX_ASYNC=1; DM_VK_GFX_ASYNC=0 turns it off).
 // A draw with a *new* key can queue its exact pipeline here instead of
 // running the driver compiler on the replay thread. While pending, that draw
 // is deferred; there is no placeholder pipeline and no blocked frame.
@@ -1048,7 +1049,7 @@ static int gfx_async_submit(gval *entry, vka_shader *const sh[VKA_NSTAGE], const
         pthread_t th;
         if (!pthread_create(&th, NULL, gfx_async_main, NULL)) {
             pthread_detach(th); g_gfx_arunning = 1;
-            VLOG("async graphics: worker started (opt-in); safe draws may be deferred while new pipelines compile");
+            VLOG("async graphics: worker started (auto on verified Pokopia Adreno driver; DM_VK_GFX_ASYNC=0 disables); eligible draws may be deferred");
         }
     }
     if (!g_gfx_arunning) { pthread_mutex_unlock(&g_gfx_amu); free(j); return 0; }
