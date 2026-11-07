@@ -9,6 +9,7 @@
 // The path's folder is made when missing. A capture is game data: it stays on the phone or in the game's work folder, never in the repository
 #if defined(__ANDROID__)
 #include "vka_capture.h"
+#include "../tex/nvn_deswizzle.h"
 #include "../nvn/nvn_hmap.h"
 #include "../../host/plat/plat.h"
 #include <errno.h>
@@ -120,6 +121,134 @@ uint8_t *vcap_img_level0(vka_img *im, size_t *n) {
     if (cb) { vcap_img_copy(cb, im, &s, 1, h.b, 0); if (vcap_cb_run(cb) && (out = malloc((size_t)s.bytes))) { memcpy(out, h.p, (size_t)s.bytes); *n = (size_t)s.bytes; } }
     vcap_hbuf_free(&h);
     return out;
+}
+
+// NVN texture readback is a real guest API (Pokopia calls it four times during
+// startup). The old Android stub returned without writing dst. On Metal a
+// GPU-owned texture is read from the image, and an unmodified one can be read
+// from its pool storage; use the same split here. The Vulkan capture machinery
+// above provides a host-coherent staging buffer and a serialized, waited copy.
+// This function is called on the game's CPU thread, not the Vulkan replay thread.
+static void readtex_rows(uint8_t *dst, size_t dst_row, size_t dst_img,
+                         const uint8_t *src, size_t src_row, size_t src_img,
+                         size_t row_bytes, size_t rows, uint32_t slices) {
+    for (uint32_t k = 0; k < slices; ++k)
+        for (size_t y = 0; y < rows; ++y)
+            memcpy(dst + (size_t)k * dst_img + y * dst_row,
+                   src + (size_t)k * src_img + y * src_row, row_bytes);
+}
+static int readtex_cpu(const tex_t *t, unsigned lv, unsigned layer,
+                       const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img,
+                       uint32_t bw, uint32_t bh, uint32_t bpb, uint32_t ns) {
+    if (!t->mem || t->d.target == NVN_TEXTURE_TARGET_3D ||
+        t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    unsigned pf = 0; int sp = 0;
+    if (t->pool && (!nvn_pool_live(t->pool, &pf, &sp) || sp ||
+        (pf & NVN_MEMORY_POOL_FLAGS_VIRTUAL))) return 0;
+    uint32_t w = t->d.width >> lv ? t->d.width >> lv : 1;
+    uint32_t h = t->d.height >> lv ? t->d.height >> lv : 1;
+    size_t full_row = ((size_t)w + bw - 1) / bw * bpb;
+    size_t full_rows = ((size_t)h + bh - 1) / bh;
+    if (!full_row || full_rows > (64u << 20) / full_row) return 0;
+    uint8_t *plane = malloc(full_row * full_rows);
+    if (!plane) return 0;
+    int ok = 1;
+    for (uint32_t z = 0; z < ns && ok; ++z) {
+        unsigned ly = layer + (unsigned)r->zoffset + z;
+        if (ly >= t->L.layers) { ok = 0; break; }
+        if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) {
+            if (lv) { ok = 0; break; }
+            size_t pitch = t->d.stride ? t->d.stride : full_row;
+            if (pitch < full_row) { ok = 0; break; }
+            const uint8_t *base = t->mem + (size_t)ly * t->L.layer_size;
+            for (size_t y = 0; y < full_rows; ++y)
+                memcpy(plane + y * full_row, base + y * pitch, full_row);
+        } else if (nvn_deswizzle(&t->d, lv, ly, t->mem, plane, full_row)) {
+            ok = 0; break;
+        }
+        size_t x = (size_t)r->xoffset / bw * bpb;
+        size_t y = (size_t)r->yoffset / bh;
+        size_t bytes = ((size_t)r->width + bw - 1) / bw * bpb;
+        size_t rows = ((size_t)r->height + bh - 1) / bh;
+        readtex_rows(dst + (size_t)z * img, row, img,
+                     plane + y * full_row + x, full_row, full_row * full_rows,
+                     bytes, rows, 1);
+    }
+    free(plane);
+    return ok;
+}
+void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0,
+                     const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+    if (!t || !r || !dst || r->xoffset < 0 || r->yoffset < 0 || r->zoffset < 0 ||
+        r->width <= 0 || r->height <= 0 || r->depth <= 0) return;
+    int ibw = 0, ibh = 0, nb = nvn_fmt_bpb(t->d.format, &ibw, &ibh);
+    if (nb <= 0 || ibw <= 0 || ibh <= 0 || level >= (t->d.levels ? t->d.levels : 1)) return;
+    uint32_t bw = (uint32_t)ibw, bh = (uint32_t)ibh, bpb = (uint32_t)nb;
+    uint32_t w = t->d.width >> level ? t->d.width >> level : 1;
+    uint32_t h = t->d.height >> level ? t->d.height >> level : 1;
+    uint32_t ns = (uint32_t)r->depth;
+    uint32_t dep = t->d.target == NVN_TEXTURE_TARGET_3D ?
+        (t->d.depth >> level ? t->d.depth >> level : 1) : t->L.layers;
+    if ((uint64_t)r->xoffset + (uint32_t)r->width > w ||
+        (uint64_t)r->yoffset + (uint32_t)r->height > h ||
+        (uint64_t)r->zoffset + ns + (t->d.target == NVN_TEXTURE_TARGET_3D ? 0 : layer0) > dep ||
+        r->xoffset % ibw || r->yoffset % ibh ||
+        ((r->width % ibw) && r->xoffset + r->width != (int)w) ||
+        ((r->height % ibh) && r->yoffset + r->height != (int)h)) return;
+    size_t bytes = ((size_t)r->width + bw - 1) / bw * bpb;
+    size_t rows = ((size_t)r->height + bh - 1) / bh;
+    if (!bytes || rows > (64u << 20) / bytes || ns > (64u << 20) / (bytes * rows)) return;
+    size_t piece = bytes * rows;
+    if (row < bytes || img < row * rows) return;
+    int ok = 0, from_gpu = 0;
+    vka_img *im = vka_tex_acquire(t->serial);
+    if (im && im->inited && im->f.kind < 3 && im->samples == 1 &&
+        level >= im->base && level - im->base < im->levels &&
+        im->f.bpb == bpb && im->f.bw == bw && im->f.bh == bh) {
+        uint32_t lv = level - im->base;
+        vcap_hbuf hb;
+        if (vcap_hbuf_make(&hb, piece * ns)) {
+            // Wait for earlier guest submissions: this must not read stale GPU
+            // output while the guest CPU has requested a synchronous read.
+            mtl_finish();
+            VkCommandBuffer cb = vcap_cb_begin();
+            if (cb) {
+                VkBufferImageCopy *copies = calloc(ns, sizeof *copies);
+                if (copies) {
+                    for (uint32_t z = 0; z < ns; ++z) {
+                        int d3 = t->d.target == NVN_TEXTURE_TARGET_3D;
+                        copies[z] = (VkBufferImageCopy){
+                            .bufferOffset = (VkDeviceSize)z * piece,
+                            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv,
+                                                d3 ? 0u : layer0 + (uint32_t)r->zoffset + z, 1},
+                            .imageOffset = {r->xoffset, r->yoffset, d3 ? r->zoffset + (int32_t)z : 0},
+                            .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}
+                        };
+                    }
+                    vka_barrier(cb);
+                    vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, hb.b, ns, copies);
+                    free(copies);
+                    ok = vcap_cb_run(cb);
+                    if (ok) {
+                        readtex_rows(dst, row, img, hb.p, bytes, piece, bytes, rows, ns);
+                        from_gpu = 1;
+                    }
+                } else {
+                    // vcap_cb_begin holds the one-off mutex; always finish it.
+                    (void)vcap_cb_run(cb);
+                }
+            }
+            vcap_hbuf_free(&hb);
+        }
+    }
+    if (im) vka_tex_drop(im);
+    if (!ok) ok = readtex_cpu(t, level, layer0, r, dst, row, img, bw, bh, bpb, ns);
+    static _Atomic unsigned n;
+    if (atomic_fetch_add(&n, 1) < 24)
+        LOG("%s NVN ReadTexels serial=%llu lv=%u layer=%u region=%dx%dx%d at %d,%d,%d bytes=%zu result=%s",
+            ok ? "[vk]" : "[RED] vk:", (unsigned long long)t->serial, level, layer0,
+            r->width, r->height, r->depth, r->xoffset, r->yoffset, r->zoffset,
+            piece * ns, ok ? (from_gpu ? "GPU readback" : "guest storage") : "unsupported");
 }
 
 // ---------- PNG ----------
