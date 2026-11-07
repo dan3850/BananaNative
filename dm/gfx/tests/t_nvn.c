@@ -773,7 +773,7 @@ int main(void) {
             {NVN_FORMAT_RGBA_DXT1, 64, 64, 1, {{0, 0, 4, 4}, {60, 60, 4, 4}, {16, 8, 32, 20}, {0, 32, 64, 4}, {0, 0, 64, 64}}},
             {NVN_FORMAT_RGBA16F, 33, 17, 2, {{32, 16, 1, 1}, {1, 2, 30, 13}, {0, 0, 33, 1}, {5, 9, 17, 8}, {0, 0, 33, 17}}},
         };
-        int bad = 0, n = 0; uint32_t seed = 12345;
+        int bad = 0, n = 0, prepared_bad = 0, prepared_n = 0; uint32_t seed = 12345;
         for (unsigned c = 0; c < sizeof cs / sizeof cs[0]; c++) {
             NVNtextureBuilder b; NVNtexture t; P(nvnTextureBuilderSetDevice)(&b, &dev); P(nvnTextureBuilderSetDefaults)(&b);
             P(nvnTextureBuilderSetTarget)(&b, cs[c].layers > 1 ? NVN_TEXTURE_TARGET_2D_ARRAY : NVN_TEXTURE_TARGET_2D);
@@ -789,6 +789,19 @@ int main(void) {
                 for (size_t i = 0; i < wbb * hbb; i++) src[i] = (uint8_t)(seed = seed * 1103515245u + 12345u) >> 5;
                 memcpy(want, wtmem, tt->L.size);   // expected: decode the whole level, patch, re-encode (only the last layer)
                 nvn_deswizzle(&tt->d, 0, (unsigned)z, want, lin, lp);
+                // Prepared parallel slices must decode byte-identically to
+                // the original whole-level decoder, including odd-width
+                // uncompressed, block-compressed and layered textures.
+                if (k == 0) {
+                    nvn_deswizzle_ctx geo;
+                    uint8_t alt[1 << 16] = {0};
+                    int rc = nvn_deswizzle_prepare(&tt->d, 0, (unsigned)z, &geo);
+                    for (uint32_t row = 0; !rc && row < (uint32_t)lr; row += 3)
+                        rc = nvn_deswizzle_rows_prepared(&geo, want, alt, lp, row,
+                                                         row + 3 < (uint32_t)lr ? row + 3 : (uint32_t)lr);
+                    prepared_bad += rc || memcmp(lin, alt, lp * lr) != 0;
+                    prepared_n++;
+                }
                 for (size_t r = 0; r < hbb; r++) memcpy(lin + ((size_t)y / bh + r) * lp + (size_t)(x / bw) * bpb, src + r * wbb, wbb);
                 nvn_swizzle(&tt->d, 0, (unsigned)z, lin, lp, want); (void)lr;
                 NVNtextureView vw; P(nvnTextureViewSetDefaults)(&vw); P(nvnTextureViewSetLayers)(&vw, z, 1);
@@ -799,6 +812,8 @@ int main(void) {
             P(nvnTextureFinalize)(&t);
         }
         EXPECT("WriteTexels region write byte-identical to a whole-level round trip (15 cases)", 0, bad); EXPECT("WriteTexels region case count", 15, n);
+        EXPECT("prepared 3-row deswizzle matches full decode for three texture formats", 0, prepared_bad);
+        EXPECT("prepared deswizzle checked one instance of each format", 3, prepared_n);
         P(nvnMemoryPoolFinalize)(&wtp);
     }
 
