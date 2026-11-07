@@ -699,6 +699,19 @@ static uint8_t *g_pw_buf; static size_t g_pw_len, g_pw_cap; static uint32_t g_pw
 static uint64_t *g_pw_set; static size_t g_pw_setcap, g_pw_setn;   // their hashes
 static uint8_t *g_pw_load; static size_t g_pw_load_len; static uint32_t g_pw_load_n;   // the loaded records, read by the prewarm threads (not changed after pw_load)
 static _Atomic uint32_t g_pw_next, g_pw_done, g_pw_made, g_pw_had, g_pw_bad; static int g_pw_threads; static uint64_t g_pw_t0;
+// Pokopia: a shared, claim-once prewarm queue. A ProgramSetShaders event moves
+// matching *known* graphics records ahead, without making extra pipelines.
+// A mutex protects the queue (not Vulkan creation); once claimed a record
+// cannot be claimed by another worker, even if it was promoted repeatedly.
+static pthread_mutex_t g_pw_qmu = PTHREAD_MUTEX_INITIALIZER;
+static size_t *g_pw_order;                    // immutable record offsets, static slow-compute priority first
+static uint8_t *g_pw_claimed, *g_pw_urgent_flag;
+static uint32_t *g_pw_urgent;
+static uint32_t g_pw_seq, g_pw_uhead, g_pw_utail, g_pw_claim_n, g_pw_limit, g_pw_critical_n;
+static _Atomic uint32_t g_pw_promoted_n;
+enum { PW_EARLY_KEYS = 128 };
+static uint64_t g_pw_early[PW_EARLY_KEYS];
+static uint32_t g_pw_early_n;
 static size_t pw_size(const pwrec *r) { return sizeof *r + ((r->klen + 7) & ~(size_t)7); }
 static int pw_set_add(uint64_t h) {   // 1 = new
     if (!h) h = 1;
@@ -881,13 +894,126 @@ static int pw_pokopia_rank(const pwrec *r) {
     }
     return 4;
 }
+// Promoting a shader is a scheduling hint only. It never translates shader
+// code or builds pipelines on the NVN/game thread. ProgramSetShaders can fire
+// before pc_open_once loads the key file; retain its recent keys for init.
+static uint32_t pw_promote_locked(uint64_t key) {
+    if (!g_pw_order || !g_pw_urgent || !key) return 0;
+    uint32_t moved = 0;
+    for (uint32_t i = g_pw_critical_n; i < g_pw_load_n; i++) {
+        if (g_pw_claimed[i] || g_pw_urgent_flag[i]) continue;
+        pwrec r; memcpy(&r, g_pw_load + g_pw_order[i], sizeof r);
+        if (r.kind != 0) continue;       // compute jobs keep their existing ordering
+        for (int st = 0; st < 5; st++)
+            if (r.key[st] == key) {
+                g_pw_urgent[g_pw_utail++] = i;
+                g_pw_urgent_flag[i] = 1;
+                moved++;
+                break;
+            }
+    }
+    if (moved) atomic_fetch_add(&g_pw_promoted_n, moved);
+    return moved;
+}
+void vka_pso_promote_shader(uint64_t key) {
+    if (!key || strcmp(DM_GAME_ID, "0400A3A01EE4C000")) return;
+    const char *off = getenv("DM_VK_PREWARM_PROMOTE");
+    if (off && !strcmp(off, "0")) return;  // A/B without changing the APK
+    pthread_mutex_lock(&g_pw_qmu);
+    if (!g_pw_order) g_pw_early[g_pw_early_n++ % PW_EARLY_KEYS] = key;
+    else {
+        uint32_t moved = pw_promote_locked(key);
+        static _Atomic uint32_t logged;
+        if (moved && atomic_fetch_add(&logged, 1) < 8)
+            VLOG("Pokopia prewarm: shader %016llx moved %u known graphics pipelines ahead of FIFO",
+                 (unsigned long long)key, moved);
+    }
+    pthread_mutex_unlock(&g_pw_qmu);
+}
+static int pw_queue_init(void) {
+    uint32_t n = g_pw_load_n;
+    size_t *offs = malloc((size_t)n * sizeof *offs), *order = malloc((size_t)n * sizeof *order);
+    uint8_t *claimed = calloc(n, 1), *urgent_flag = calloc(n, 1);
+    uint32_t *urgent = malloc((size_t)n * sizeof *urgent);
+    if (!offs || !order || !claimed || !urgent_flag || !urgent) {
+        free(offs); free(order); free(claimed); free(urgent_flag); free(urgent);
+        return 0; // original worker-local FIFO remains as a low-memory fallback
+    }
+    for (size_t o = 0, i = 0; i < n; i++) {
+        offs[i] = o;
+        pwrec r; memcpy(&r, g_pw_load + o, sizeof r);
+        o += pw_size(&r);
+    }
+    uint32_t count = 0, slow_compute = 0, slow_graphics = 0;
+    for (int rank = 0; rank < 5; rank++)
+        for (uint32_t i = 0; i < n; i++) {
+            pwrec r; memcpy(&r, g_pw_load + offs[i], sizeof r);
+            if (pw_pokopia_rank(&r) != rank) continue;
+            order[count++] = offs[i];
+            if (rank < 3) slow_compute++;
+            else if (rank == 3) slow_graphics++;
+        }
+    free(offs);
+    if (count != n) { free(order); free(claimed); free(urgent_flag); free(urgent); return 0; }
+    pthread_mutex_lock(&g_pw_qmu);
+    g_pw_order = order; g_pw_claimed = claimed; g_pw_urgent_flag = urgent_flag; g_pw_urgent = urgent;
+    g_pw_seq = g_pw_uhead = g_pw_utail = g_pw_claim_n = 0;
+    g_pw_critical_n = slow_compute;
+    int cap = VKA_ENV("DM_VK_PREWARM_MAX", 8192);
+    g_pw_limit = cap > 0 && (uint32_t)cap < n ? (uint32_t)cap : n;
+    if (cap == 0) g_pw_limit = 0;
+    // The loader may be initialized after the game has already set programs.
+    uint32_t early = g_pw_early_n < PW_EARLY_KEYS ? g_pw_early_n : PW_EARLY_KEYS;
+    uint32_t promoted = 0;
+    for (uint32_t i = 0; i < early; i++) {
+        uint32_t j = g_pw_early_n > PW_EARLY_KEYS ? (g_pw_early_n + i) % PW_EARLY_KEYS : i;
+        promoted += pw_promote_locked(g_pw_early[j]);
+    }
+    pthread_mutex_unlock(&g_pw_qmu);
+    VLOG("Pokopia adaptive prewarm: %u prior slow compute, %u prior slow graphics, %u early shader matches moved ahead of %u keys (max %u); DM_VK_PREWARM_PROMOTE=0 disables promotion",
+         slow_compute, slow_graphics, promoted, n, g_pw_limit);
+    return 1;
+}
+static int pw_queue_take(size_t *off) {
+    pthread_mutex_lock(&g_pw_qmu);
+    uint32_t i = UINT32_MAX;
+    if (g_pw_claim_n < g_pw_limit) {
+        // The three costly compute jobs keep priority over all promotions.
+        while (g_pw_seq < g_pw_critical_n && g_pw_claimed[g_pw_seq]) g_pw_seq++;
+        if (g_pw_seq < g_pw_critical_n) i = g_pw_seq++;
+        else {
+            while (g_pw_uhead < g_pw_utail) {
+                uint32_t p = g_pw_urgent[g_pw_uhead++];
+                if (!g_pw_claimed[p]) { i = p; break; }
+            }
+            if (i == UINT32_MAX) {
+                while (g_pw_seq < g_pw_load_n && g_pw_claimed[g_pw_seq]) g_pw_seq++;
+                if (g_pw_seq < g_pw_load_n) i = g_pw_seq++;
+            }
+        }
+    }
+    if (i != UINT32_MAX) {
+        g_pw_claimed[i] = 1;
+        g_pw_claim_n++;
+        *off = g_pw_order[i];
+    }
+    pthread_mutex_unlock(&g_pw_qmu);
+    return i != UINT32_MAX;
+}
 static void *pw_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // this thread (Linux: per-thread nice), under the game's threads
     uint32_t max = (uint32_t)VKA_ENV("DM_VK_PREWARM_MAX", 8192);
-    size_t *offs = NULL;   // walked once by each thread to find the record of index i: built here (the list is small)
-    uint32_t n = g_pw_load_n; offs = malloc((n ? n : 1) * sizeof *offs);
-    if (offs) for (size_t o = 0, i = 0; i < n; i++) { offs[i] = o; pwrec r; memcpy(&r, g_pw_load + o, sizeof r); o += pw_size(&r); }
+    // Other games and out-of-memory fallback keep their original local FIFO.
+    // Pokopia workers share a claim-once queue with live shader promotions.
+    size_t *offs = NULL;
+    uint32_t n = g_pw_load_n;
+    if (!g_pw_order) {
+        offs = malloc((n ? n : 1) * sizeof *offs);
+        if (offs) for (size_t o = 0, i = 0; i < n; i++) {
+            offs[i] = o; pwrec r; memcpy(&r, g_pw_load + o, sizeof r); o += pw_size(&r);
+        }
+    }
     // Prioritize known slow compute and graphics pipelines before the general
     // prewarm queue. Preserve each record's original byte offset so pw_mark_bad
     // still flags the correct record in the persistent buffer.
@@ -915,10 +1041,15 @@ static void *pw_main(void *a) {
     }
     for (;;) {
         pause_point();
-        uint32_t i = atomic_fetch_add(&g_pw_next, 1);
-        if (!offs || i >= n || i >= max) break;
-        pwrec r; memcpy(&r, g_pw_load + offs[i], sizeof r);
-        const uint8_t *kb = g_pw_load + offs[i] + sizeof r;
+        size_t off;
+        if (g_pw_order) { if (!pw_queue_take(&off)) break; }
+        else {
+            uint32_t i = atomic_fetch_add(&g_pw_next, 1);
+            if (!offs || i >= n || i >= max) break;
+            off = offs[i];
+        }
+        pwrec r; memcpy(&r, g_pw_load + off, sizeof r);
+        const uint8_t *kb = g_pw_load + off + sizeof r;
         vka_shader *sh[VKA_NSTAGE]; memset(sh, 0, sizeof sh); int bad = !pw_rec_ok(&r, kb);
         if (bad) {}
         else if (r.kind == 1) { if (!(sh[5] = vka_shader_by_key(r.key[0]))) bad = 1; }
@@ -926,7 +1057,7 @@ static void *pw_main(void *a) {
         vka_layout lay;
         if (!bad && !vka_layout_of(sh, r.kind == 1, &lay)) bad = 1;
         int made = 0;
-        if (bad) { atomic_fetch_add(&g_pw_bad, 1); pw_mark_bad(offs[i]); }
+        if (bad) { atomic_fetch_add(&g_pw_bad, 1); pw_mark_bad(off); }
         else if (r.kind == 1) { cs_obtain(sh[5], &lay, 1, &made); }
         else {
             vka_gkey k; memset(&k, 0, sizeof k); memcpy(&k, kb, r.klen < sizeof k ? r.klen : sizeof k);
@@ -945,6 +1076,8 @@ static void *pw_main(void *a) {
         VLOG("prewarm: %u of %u pipeline keys in %.1f s on %d threads: %u made, %u already there, %u dropped (shaders no longer in the library, another device's keys); the frame path waited %.0f ms for them",
              (unsigned)(atomic_load(&g_pw_made) + atomic_load(&g_pw_had) + atomic_load(&g_pw_bad)), n, (now_ns() - g_pw_t0) / 1e9, g_pw_threads, (unsigned)atomic_load(&g_pw_made),
              (unsigned)atomic_load(&g_pw_had), (unsigned)atomic_load(&g_pw_bad), atomic_load(&g_pw_wait_ns) / 1e6);
+    if (g_pw_order) VLOG("Pokopia adaptive prewarm: %u known graphics keys promoted by shader registration, %u records claimed once",
+                         (unsigned)atomic_load(&g_pw_promoted_n), g_pw_claim_n);
     return NULL;
 }
 // Pokopia's Poke Ball opening has three compute pipelines that took ~30 s
@@ -1006,6 +1139,8 @@ static void pw_start(void) {
     if (nt <= 0 || !g_pw_load_n) { if (g_pw_load_n) VLOG("prewarm: off (DM_VK_PREWARM=0): %u keys not made ahead", g_pw_load_n); return; }
     if (nt > 4) nt = 4;
     g_pw_t0 = now_ns(); g_pw_threads = 0;
+    if (!strcmp(DM_GAME_ID, "0400A3A01EE4C000") && !pw_queue_init())
+        VRED("Pokopia adaptive prewarm: could not initialize shared order; using original FIFO fallback");
     for (int i = 0; i < nt; i++) { pthread_t th; if (!pthread_create(&th, NULL, pw_main, NULL)) { pthread_detach(th); g_pw_threads++; } }
     VLOG("prewarm: %u pipeline keys of earlier runs made ahead on %d background threads (DM_VK_PREWARM=0 off)", g_pw_load_n, g_pw_threads);
 }
