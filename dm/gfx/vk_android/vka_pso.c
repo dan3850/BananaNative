@@ -846,7 +846,7 @@ static void pw_explain(vka_shader *const sh[5], const vka_gkey *k, uint32_t klen
     else VLOG("pipeline made on the frame path (%.1f ms%s), not in the prewarm list: %d records with these shaders, the nearest differs in %s",
               ms, linked ? ", linked" : "", same_sh, d[0] ? d : "nothing: the same key (the prewarm threads had not reached it yet)");
 }
-static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int *made);
+static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int async_ok, int *made);
 static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, int *made);
 // The first Pokopia playtest reached the Poke Ball scene after ~115 s and stalled
 // for ~98 s compiling these three compute shaders on Adreno 840. They are written
@@ -913,7 +913,7 @@ static void *pw_main(void *a) {
             else {
                 gkey_full fk; memset(&fk, 0, sizeof fk); memcpy(fk.sh, sh, sizeof fk.sh); fk.layout = lay.layout; fk.k = k;
                 size_t len = k.vin_static ? sizeof fk : offsetof(gkey_full, k.va);
-                gfx_obtain(&fk, fnv(&fk, len, 1469598103934665603ull), len, sh, &lay, &k, 1, &made);
+                gfx_obtain(&fk, fnv(&fk, len, 1469598103934665603ull), len, sh, &lay, &k, 1, 0, &made);
             }
         }
         if (made) atomic_fetch_add(&g_pw_made, 1); else if (!bad) atomic_fetch_add(&g_pw_had, 1);
@@ -989,6 +989,78 @@ static void pw_start(void) {
     VLOG("prewarm: %u pipeline keys of earlier runs made ahead on %d background threads (DM_VK_PREWARM=0 off)", g_pw_load_n, g_pw_threads);
 }
 
+// Optional, reversible async graphics experiment (DM_VK_GFX_ASYNC=1).
+// A draw with a *new* key can queue its exact pipeline here instead of
+// running the driver compiler on the replay thread. While pending, that draw
+// is deferred; there is no placeholder pipeline and no blocked frame.
+// The caller must reject depth/stencil and memory-writing draws; even an
+// otherwise visual-only draw may pop in, so this mode defaults OFF.
+// Workers build the same pstate and VkPipeline as the synchronous path.
+typedef struct gfx_ajob {
+    struct gfx_ajob *next;
+    gval *entry;
+    vka_shader *sh[VKA_NSTAGE];
+    vka_layout lay;
+    vka_gkey key;
+} gfx_ajob;
+static gfx_ajob *g_gfx_ahead, **g_gfx_atail = &g_gfx_ahead;
+static pthread_mutex_t g_gfx_amu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gfx_acv = PTHREAD_COND_INITIALIZER;
+static int g_gfx_arunning;
+static _Atomic uint64_t g_gfx_aqueued, g_gfx_abuilt;
+static void *gfx_async_main(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk-gfx-async");
+    for (;;) {
+        pause_point();
+        pthread_mutex_lock(&g_gfx_amu);
+        while (!g_gfx_ahead) pthread_cond_wait(&g_gfx_acv, &g_gfx_amu);
+        gfx_ajob *j = g_gfx_ahead; g_gfx_ahead = j->next;
+        if (!g_gfx_ahead) g_gfx_atail = &g_gfx_ahead;
+        pthread_mutex_unlock(&g_gfx_amu);
+        // If a frame temporarily requires this job synchronously, busy_wait
+        // can promote this worker to avoid a low-priority inversion.
+        pthread_mutex_lock(&g_mu);
+        j->entry->tid = gettid();
+        j->entry->pw = 1;
+        pthread_mutex_unlock(&g_mu);
+        pc_open();
+        pstate *P = malloc(sizeof *P);
+        VkPipeline p = P && pstate_fill(P, j->sh, &j->lay, &j->key)
+                     ? full_pipeline(P, j->sh, " (async graphics)") : VK_NULL_HANDLE;
+        free(P);
+        pthread_mutex_lock(&g_mu);
+        j->entry->p = p; j->entry->busy = 0;
+        pthread_cond_broadcast(&g_busy_cv);
+        pthread_mutex_unlock(&g_mu);
+        atomic_fetch_add(&g_gfx_abuilt, 1);
+        free(j);
+        setpriority(PRIO_PROCESS, 0, 10);
+    }
+    return NULL;
+}
+static int gfx_async_submit(gval *entry, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
+    gfx_ajob *j = malloc(sizeof *j);
+    if (!j) return 0;
+    j->next = NULL; j->entry = entry; memcpy(j->sh, sh, sizeof j->sh);
+    j->lay = *lay; j->key = *k;
+    pthread_mutex_lock(&g_gfx_amu);
+    if (!g_gfx_arunning) {
+        pthread_t th;
+        if (!pthread_create(&th, NULL, gfx_async_main, NULL)) {
+            pthread_detach(th); g_gfx_arunning = 1;
+            VLOG("async graphics: worker started (opt-in); safe draws may be deferred while new pipelines compile");
+        }
+    }
+    if (!g_gfx_arunning) { pthread_mutex_unlock(&g_gfx_amu); free(j); return 0; }
+    *g_gfx_atail = j; g_gfx_atail = &j->next;
+    pthread_cond_signal(&g_gfx_acv);
+    pthread_mutex_unlock(&g_gfx_amu);
+    uint64_t n = atomic_fetch_add(&g_gfx_aqueued, 1) + 1;
+    if (n <= 12) VLOG("async graphics: queued pipeline %llu (prepared %llu); the first draw may be deferred", (unsigned long long)n,
+                     (unsigned long long)atomic_load(&g_gfx_abuilt));
+    return 1;
+}
+
 // ---------- Graphics pipelines: the lookup ----------
 // The entry of a key, made by this thread when no one has it (made = 1). A key another thread is making (busy): the frame path waits for it (the time goes to the [longframe]
 // line's prewarm wait), a prewarm thread goes on to its next key
@@ -1001,18 +1073,24 @@ static void busy_wait(gval *g) {
     while (g->busy) pthread_cond_wait(&g_busy_cv, &g_mu);
     atomic_fetch_add(&g_pw_wait_ns, now_ns() - t0);
 }
-static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int *made) {
+static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int async_ok, int *made) {
     *made = 0;
     pthread_mutex_lock(&g_mu);
     gval *g = km_get(&g_gfx, fk, h);
     if (g) {
-        if (g->busy && prewarm) { pthread_mutex_unlock(&g_mu); return NULL; }
+        if (g->busy && (prewarm || async_ok)) { pthread_mutex_unlock(&g_mu); return prewarm ? NULL : g; }
         if (g->busy) busy_wait(g);
         pthread_mutex_unlock(&g_mu);
         return g;
     }
     g = calloc(1, sizeof *g); g->busy = 1; g->pw = (uint8_t)(prewarm != 0); g->tid = prewarm ? gettid() : 0; km_put(&g_gfx, fk, h, g);
     pthread_mutex_unlock(&g_mu);
+    if (!prewarm && async_ok && gfx_async_submit(g, sh, lay, k)) {
+        // Record the exact key even if its first draw is deliberately deferred.
+        if (!sh[7]) pw_note(0, sh, k, (uint32_t)(len - offsetof(gkey_full, k)));
+        *made = 1;
+        return g;
+    }
     uint64_t t_make = now_ns();
     pc_open();
     VkPipeline p = VK_NULL_HANDLE; int linked = 0;
@@ -1056,7 +1134,7 @@ static inline VkPipeline gval_use(gval *g) {
     if (__atomic_load_n(&g->linked, __ATOMIC_ACQUIRE)) atomic_fetch_add_explicit(&g_hy_draws, 1, memory_order_relaxed);
     return __atomic_load_n(&g->p, __ATOMIC_ACQUIRE);
 }
-VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
+VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int async_ok) {
     static gkey_full fk, last; static gval *last_g;
     // With vertex input dynamic state the key's static vertex input (va, vb: two thirds of it) stays zero: only what comes before it is hashed and compared with the
     // previous draw's key (draws in a row often share their pipeline). The entry's pipeline is read at each draw: the optimized one replaces a linked one in place
@@ -1065,7 +1143,7 @@ VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *
     memcpy(fk.sh, sh, sizeof fk.sh); fk.layout = lay->layout; memcpy(&fk.k, k, len - offsetof(gkey_full, k));
     if (last_g && !memcmp(&fk, &last, len)) return gval_use(last_g);
     int made;
-    gval *g = gfx_obtain(&fk, fnv(&fk, len, 1469598103934665603ull), len, sh, lay, k, 0, &made);
+    gval *g = gfx_obtain(&fk, fnv(&fk, len, 1469598103934665603ull), len, sh, lay, k, 0, async_ok, &made);
     memcpy(&last, &fk, len); last_g = g;
     return gval_use(g);
 }
