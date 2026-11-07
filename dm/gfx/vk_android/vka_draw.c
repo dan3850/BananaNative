@@ -746,8 +746,8 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
         VLOG("skybind begin frame=%llu shader=%016llx stage=%d descriptors=%d",
             (unsigned long long)vka_frame(), (unsigned long long)sh->key, st, n);
     for (int i = 0; i < n; i++) {
-        if (skybind) VLOG("skybind resource shader=%016llx binding=%u elem=%u desc=%u what=%d tid=%d dim=%#x addr=%llx size=%llu",
-            (unsigned long long)sh->key, r[i].binding, r[i].elem, r[i].desc, (int)r[i].what, r[i].tid,
+        if (skybind) VLOG("skybind resource shader=%016llx binding=%u elem=%u desc=%u flags=%#x fetch1d=%d what=%d tid=%d dim=%#x addr=%llx size=%llu",
+            (unsigned long long)sh->key, r[i].binding, r[i].elem, r[i].desc, r[i].flags, !!(r[i].flags & DMSH_VK_BF_FETCH1D), (int)r[i].what, r[i].tid,
             r[i].dim, (unsigned long long)r[i].addr, (unsigned long long)r[i].size);
         if (g_w.n == 512) { VRED_ONCE("more than 512 descriptors in one draw"); return 0; }
         uint32_t k = g_w.n;
