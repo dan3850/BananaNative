@@ -454,7 +454,10 @@ namespace Ryujinx.Graphics.Shader.Translation
                     context.MarkLabel(predSkipLbl);
                 }
 
-                if (writeBarrier < 6 && !op.Props.HasFlag(InstProps.Bra))
+                // Pokémon Pokopia: a predicated ALD must not defer a stale R0 over the
+                // UV register written before the wait (the striped protagonist bug).
+                // Reference: robldctrl/nxnative-pokopia, Translator.EmitOpsAmpere.
+                if (writeBarrier < 6 && !op.Props.HasFlag(InstProps.Bra) && a.Pred == RegisterConsts.PredicateTrueIndex)
                 {
                     DeferAmpereWrites(context, opStart, pending, writeBarrier, ref shadows, freeShadows);
                 }
