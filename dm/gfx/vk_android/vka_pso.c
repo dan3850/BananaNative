@@ -773,13 +773,20 @@ static int pw_save(void) {   // the saver thread or a forced save: the list when
     pwhdr2 h; memset(&h, 0, sizeof h); memcpy(h.magic, PW_MAGIC2, 8); h.gkey_size = sizeof(vka_gkey); h.n = n; h.layout = gkey_layout(); memcpy(out, &h, sizeof h);
     char tmp[1200]; snprintf(tmp, sizeof tmp, "%s.tmp", g_pw_path);
     FILE *f = fopen(tmp, "wb");
-    int ok = f && fwrite(out, 1, sizeof h + len, f) == sizeof h + len && !fclose(f) && !rename(tmp, g_pw_path);
-    if (!ok) { if (f) fclose(f); unlink(tmp); static _Atomic int k; if (atomic_fetch_add(&k, 1) < 2) VRED("prewarm list not written to %s", g_pw_path); pthread_mutex_lock(&g_pw_mu); g_pw_dirty = 1; pthread_mutex_unlock(&g_pw_mu); }
+    int ok = 0;
+    if (f) {
+        size_t total = sizeof h + len;
+        size_t written = fwrite(out, 1, total, f);
+        int closed = fclose(f);
+        // Never close the file a second time when rename fails.
+        if (written == total && !closed && !rename(tmp, g_pw_path)) ok = 1;
+    }
+    if (!ok) { unlink(tmp); static _Atomic int k; if (atomic_fetch_add(&k, 1) < 2) VRED("prewarm list not written to %s", g_pw_path); pthread_mutex_lock(&g_pw_mu); g_pw_dirty = 1; pthread_mutex_unlock(&g_pw_mu); }
     // An NXVKPW2 manifest can outlive Clear data because it lives alongside
     // the user's pack (not in Android/data). Keep the old seed intact unless
     // the new file was written in full. If the pack is read-only, the normal
     // app-local save still succeeds, and the failure is logged only once.
-    if (ok && g_pw_seed_path[0]) {
+    if (ok && n && g_pw_seed_path[0]) {
         char seedtmp[1200];
         if (snprintf(seedtmp, sizeof seedtmp, "%s.tmp", g_pw_seed_path) < (int)sizeof seedtmp) {
             FILE *sf = fopen(seedtmp, "wb");
