@@ -390,7 +390,17 @@ void mtl_prog_release(prog_t *p) {
     if (!p || !p->serial) return;
     pthread_mutex_lock(&g_mu); prent *e = pr_find(p->serial); if (e) { e->serial = ~0ull; memset(&e->ps, 0, sizeof e->ps); } pthread_mutex_unlock(&g_mu);   // a tombstone
 }
-void mtl_prog_prefetch(const prog_t *p) { (void)p; }   // modules are made at the program's first draw (vka_prog_shaders)
+// ProgramSetShaders already has stable hashes for each stage, before the
+// first draw. Promote only existing manifest PSOs that use these shader keys;
+// the game's thread does NOT create a shader module or Vulkan pipeline here.
+void mtl_prog_prefetch(const prog_t *p) {
+    if (!p || strcmp(DM_GAME_ID, "0400A3A01EE4C000")) return;
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        uint8_t digest[8];
+        if (prog_key(p, i, digest))
+            vka_pso_promote_shader(vka_shlib_key(digest));
+    }
+}
 
 int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
     memset(out, 0, sizeof *out);
