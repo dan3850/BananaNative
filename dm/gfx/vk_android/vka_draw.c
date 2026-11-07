@@ -725,7 +725,30 @@ static writes_t g_w;
 static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
 // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
 static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
+    // First binding resolution for the main scene, lighting and final pass,
+    // after the requested frame. The ordinary missing-view warning stops
+    // after eight globally and misses the active scene; this trace does not.
+    int skybind = 0, at = VKA_ENV("DM_VK_SKY_BIND_AT", 0);
+    if (at > 0 && vka_frame() >= (uint64_t)at) {
+        static const uint64_t keys[] = {
+            0x3fb06ea7d8ed1272ull, 0x754327f84eca6eedull,
+            0x15882e6f064fef79ull, 0x25fbeb7088c91840ull,
+            0xbd28fb4309ff5d77ull, 0xed5f4c6386ca621dull
+        };
+        static _Atomic unsigned seen;
+        for (unsigned j = 0; j < sizeof keys / sizeof *keys; j++) if (sh->key == keys[j]) {
+            unsigned bit = 1u << j;
+            skybind = !(atomic_fetch_or(&seen, bit) & bit);
+            break;
+        }
+    }
+    if (skybind)
+        VLOG("skybind begin frame=%llu shader=%016llx stage=%d descriptors=%d",
+            (unsigned long long)vka_frame(), (unsigned long long)sh->key, st, n);
     for (int i = 0; i < n; i++) {
+        if (skybind) VLOG("skybind resource shader=%016llx binding=%u elem=%u desc=%u what=%d tid=%d dim=%#x addr=%llx size=%llu",
+            (unsigned long long)sh->key, r[i].binding, r[i].elem, r[i].desc, (int)r[i].what, r[i].tid,
+            r[i].dim, (unsigned long long)r[i].addr, (unsigned long long)r[i].size);
         if (g_w.n == 512) { VRED_ONCE("more than 512 descriptors in one draw"); return 0; }
         uint32_t k = g_w.n;
         VkWriteDescriptorSet *w = &g_w.w[k]; VkDescriptorBufferInfo *bi = &g_w.bi[k]; VkDescriptorImageInfo *ii = &g_w.ii[k];
@@ -776,6 +799,12 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                     }
                 }
                 if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
+                if (skybind && tid) {
+                    char why[320]; vka_tex_id_desc(tid, why, sizeof why);
+                    VLOG("skybind image shader=%016llx binding=%u tid=%d target=%d view=%s (%s)",
+                        (unsigned long long)sh->key, r[i].binding, tid,
+                        vka_tex_id_target(tid), v ? "OK" : "MISSING", why);
+                }
                 // A 2D texture in a 3D or cube slot: what the game leaves bound where a shader's branch does not sample (DKB's materials keep a 1x1 2D texture in their volume slot 12).
                 // It reads as unbound, zeros, as nvn_mtl.m's zero 3D / zero cube fallback does; noted once. Other mismatches are reported
                 int dd = r[i].dim & DMSH_VK_DIM_MASK, tt = tid && !v ? vka_tex_id_target(tid) : -1;
