@@ -655,6 +655,89 @@ public final class MainActivity extends Activity {
         new AlertDialog.Builder(this).setTitle(ok.isEmpty() && prepare.isEmpty() && experimental.isEmpty() ? "No game added" : "Games added").setMessage(m).setPositiveButton("OK", null).show();
     }
 
+    /** An unknown game is a real library entry, not a fake playable profile. */
+    private static String experimentalName(File game) {
+        String name = game.getName();
+        if (Nup.isNup(game) && name.length() > 4) name = name.substring(0, name.length() - 4);
+        return name.isEmpty() ? "Unknown game" : name;
+    }
+
+    /**
+     * Read-only bring-up report. Everything that can inspect the NUP/NPDM or
+     * enumerate pack folders runs on a worker, never the UI thread.
+     * No game code runs; an arbitrary Title ID has no libnxhost_<id>.so.
+     */
+    private void experimentalDiagnostics(Game g) {
+        Toast.makeText(this, "Checking experimental game…", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            File game = new File(g.gameDir);
+            boolean nup = Nup.isNup(game);
+            boolean dump = Pack.isDump(game);
+            StringBuilder b = new StringBuilder();
+            b.append("Game: ").append(g.name).append("\n")
+             .append("Title ID: ").append(g.titleId).append("\n")
+             .append("Source: ").append(g.gameDir).append("\n")
+             .append("Type: ").append(nup ? ".nup" : "dump folder").append("\n")
+             .append("Readable: ").append(game.canRead() ? "yes" : "no").append("\n")
+             .append("Full dump for preparation: ").append(dump ? "appears present" : "not detected / incomplete").append("\n\n")
+             .append("Native host: NOT COMPILED for this Title ID\n")
+             .append("Profile: dm/games/").append(g.titleId).append("/game.tsv not embedded in this APK\n");
+
+            // A pack can exist independently of this APK's supported Title IDs.
+            // Inspect its metadata, but never claim it will run in this host.
+            Pack candidate = null;
+            File found = null;
+            String packProblem = null;
+            try {
+                List<File> dirs = PackFind.candidates(new File(g.packDir), AppStorage.pack(this, g.titleId),
+                        game, g.titleId, PackFind.volumeRoot(game));
+                for (File dir : dirs) {
+                    try {
+                        Pack pack = Pack.read(dir);
+                        if (!pack.titleId.equals(g.titleId)) continue;
+                        candidate = pack;
+                        found = dir;
+                        break;
+                    } catch (IOException e) {
+                        if (packProblem == null) packProblem = e.getMessage();
+                    }
+                }
+            } catch (RuntimeException e) {
+                packProblem = e.toString();
+            }
+            b.append("\nPack: ");
+            if (candidate == null) {
+                b.append(packProblem == null ? "no readable matching pack found" : "no valid matching pack (" + packProblem + ")");
+            } else {
+                b.append(found.getPath()).append("\n")
+                 .append("Pack version: ").append(candidate.version).append("\n")
+                 .append("Pack shader library: ").append(candidate.library() != null ? "present" : "missing for this build").append("\n")
+                 .append("Pack rewritten code: ").append(candidate.unfinishedModule() == null ? "present" : "incomplete");
+            }
+            b.append("\n\nTo attempt execution in a future build:\n")
+             .append("1. Create and validate the title-specific game profile and supported NSO build IDs.\n")
+             .append("2. Compile libnxhost_").append(g.titleId).append(".so and libnxlaunch_")
+             .append(g.titleId).append(".so (or implement a validated generic host).\n")
+             .append("3. Prepare a compatible Android game pack and Vulkan shader library.\n\n")
+             .append("Adding this game to the library has not changed its files, packs or saves.");
+            String report = b.toString();
+            android.util.Log.i("nxnative", "Experimental diagnostics: " + report.replace("\n", " | "));
+            runOnUiThread(() -> {
+                if (isFinishing()) return;
+                new AlertDialog.Builder(this).setTitle("Experimental diagnostics")
+                        .setMessage(report)
+                        .setPositiveButton("Copy report", (d, w) -> {
+                            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                            if (clipboard != null) {
+                                clipboard.setPrimaryClip(ClipData.newPlainText("BananaNative experimental game", report));
+                                Toast.makeText(this, "Diagnostic report copied", Toast.LENGTH_SHORT).show();
+                            }
+                        })
+                        .setNegativeButton("Close", null).show();
+            });
+        }, "nx-experimental-diagnostics").start();
+    }
+
     private static List<String> profileIds() {
         List<String> ids = new ArrayList<>();
         for (Profile p : Profile.all()) ids.add(p.titleId);
@@ -666,11 +749,11 @@ public final class MainActivity extends Activity {
      * and Import pack… put it (the card says "Needs preparing" and its button prepares). An existing entry of the same game path is kept as it is
      */
     Game cardFor(File game, String id) { return cardFor(game, id, null); }
-    Game cardFor(File game, String id, String experimentalName) {
+    Game cardFor(File game, String id, String suggestedName) {
         List<Game> list = Game.load(this);
         for (Game g : list) if (g.gameDir.equals(game.getPath())) return g;
         Profile p = Profile.of(id);
-        String name = p != null ? p.name : experimentalName != null ? experimentalName : experimentalName(game);
+        String name = p != null ? p.name : suggestedName != null ? suggestedName : experimentalName(game);
         Game g = new Game(id, name, game.getPath(), AppStorage.pack(this, id).getPath());
         list.add(g);
         Game.save(this, list);
