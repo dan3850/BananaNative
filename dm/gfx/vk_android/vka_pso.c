@@ -1029,7 +1029,7 @@ static void *gfx_async_main(void *arg) {
                      ? full_pipeline(P, j->sh, " (async graphics)") : VK_NULL_HANDLE;
         free(P);
         pthread_mutex_lock(&g_mu);
-        j->entry->p = p; j->entry->busy = 0;
+        __atomic_store_n(&j->entry->p, p, __ATOMIC_RELEASE); j->entry->busy = 0;
         pthread_cond_broadcast(&g_busy_cv);
         pthread_mutex_unlock(&g_mu);
         atomic_fetch_add(&g_gfx_abuilt, 1);
