@@ -62,6 +62,16 @@ adb shell am start -n dev.nxnative.android/.MainActivity --es game /sdcard/SW2/D
 adb shell am start -n dev.nxnative.android/.MainActivity --es add_game /sdcard/SW2   # Add game's own path for a picked folder or .nup: all its games, one summary
 ```
 
+### Experimental titles without a compiled host
+
+1. On Home, tap **Add game** and choose a `.nup`, dump folder or a folder containing multiple games. Their Title IDs are read from the NUP/NPDM; they are never guessed from filenames.
+2. When a single game's ID is absent from `BuildConfig.NX_PROFILES`, tap **Add to library** in the Experimental dialog. When adding a folder of games, unsupported titles are added as experimental cards automatically and listed in the summary.
+3. The card says **Experimental · native host missing**, and its only main action is **Diagnostics** (no misleading Play/Prepare). The read-only report lists Title ID, path, dump completeness, matching available pack and what must be compiled. Tap **Copy report** to share the result.
+4. Use **⋯ Manage** to see its folders, save tools and Experimental diagnostics, or remove the card. Removing only forgets the library entry.
+5. Pokopia, DK and other games compiled into the APK retain the normal **Play/Prepare** path.
+
+**Expected:** You can catalogue an arbitrary, readable title, but you cannot run it yet. An uncompiled `libnxhost_<title ID>.so` cannot be made to run by removing launcher checks. Bringing up a new game requires its profile, host and pack. This mode never attempts to run the unknown code or silently substitute another game's host.
+
 ## 6. Start it and watch the log
 
 Start the log on the Mac first, then tap the game:
