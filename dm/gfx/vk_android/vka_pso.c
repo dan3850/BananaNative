@@ -129,6 +129,7 @@ static VkPipelineCache g_pc; static char g_pc_path[1024], g_pw_path[1100], g_pw_
 static uint64_t g_ngfx, g_ncs, g_nfail, g_ncs_over, g_create_ns, g_frame_made;   // all pipelines made (frame path, background and prewarm); g_frame_made / g_create_ns: on the frame path only
 static uint64_t g_probe_hit, g_probe_miss, g_probe_miss_ns;          // GPL: the cache-only try before a link (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
 static _Atomic uint64_t g_save_ns_total, g_hy_draws, g_pw_wait_ns;
+static _Atomic uint64_t g_gfx_aqueued, g_gfx_abuilt, g_gfx_adeferred;   // queued/build jobs, draws deferred while a nonblocking pipeline is pending
 static void pw_load(void); static void pw_start(void); static int pw_save(void);
 static void *saver_main(void *a);
 static pthread_mutex_t g_save_mu = PTHREAD_MUTEX_INITIALIZER;   // one save at a time (the saver thread, a forced save)
@@ -236,6 +237,11 @@ void mtl_pso_line(char *out, size_t n) {
     int k = snprintf(out, n, "%llu graphics + %llu compute pipelines (%llu failed, %llu compute (program, layout) pairs not made for shared memory, %llu on the frame path), %llu set layouts, %.0f ms creating", (unsigned long long)g_ngfx, (unsigned long long)g_ncs,
                      (unsigned long long)g_nfail, (unsigned long long)g_ncs_over, (unsigned long long)g_frame_made, (unsigned long long)g_nlayouts, g_create_ms);
     if (V.gpl && k > 0 && (size_t)k + 3 < n) { memcpy(out + k, "; ", 3); vka_gpl_line(out + k + 2, n - (size_t)k - 2); }
+    size_t used = strlen(out);
+    if (used < n && atomic_load(&g_gfx_aqueued))
+        snprintf(out + used, n - used, "; async gfx %llu queued / %llu ready, %llu draw(s) deferred",
+                 (unsigned long long)atomic_load(&g_gfx_aqueued), (unsigned long long)atomic_load(&g_gfx_abuilt),
+                 (unsigned long long)atomic_load(&g_gfx_adeferred));
 }
 
 // The long-frame log's counters (hle_nvn.c): pipelines made on the frame path and the time it took, cumulative (it takes each frame's difference). Background and prewarm
@@ -842,7 +848,7 @@ static void pw_explain(vka_shader *const sh[5], const vka_gkey *k, uint32_t klen
     char d[256] = ""; size_t q = 0;
     for (int f = 0; f < NF && q < sizeof d; f++) if (bestmask >> f & 1) q += (size_t)snprintf(d + q, sizeof d - q, "%s%s", q ? ", " : "", F[f].name);
     if (!same_sh) VLOG("pipeline made on the frame path (%.1f ms%s), not in the prewarm list: no record with these shaders (vs %016llx fs %016llx; first met in this run)",
-                       ms, linked ? ", linked" : "", (unsigned long long)want[0], (unsigned long long)want[4]);
+                       ms, linked ? ", linked" : "", (unsigned long long)want[0], (unsigned long long)want[1]);
     else VLOG("pipeline made on the frame path (%.1f ms%s), not in the prewarm list: %d records with these shaders, the nearest differs in %s",
               ms, linked ? ", linked" : "", same_sh, d[0] ? d : "nothing: the same key (the prewarm threads had not reached it yet)");
 }
@@ -1023,7 +1029,6 @@ static gfx_ajob *g_gfx_ahead, **g_gfx_atail = &g_gfx_ahead;
 static pthread_mutex_t g_gfx_amu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_gfx_acv = PTHREAD_COND_INITIALIZER;
 static int g_gfx_arunning;
-static _Atomic uint64_t g_gfx_aqueued, g_gfx_abuilt;
 static void *gfx_async_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-gfx-async");
     for (;;) {
@@ -1150,6 +1155,15 @@ static inline VkPipeline gval_use(gval *g) {
     if (__atomic_load_n(&g->linked, __ATOMIC_ACQUIRE)) atomic_fetch_add_explicit(&g_hy_draws, 1, memory_order_relaxed);
     return __atomic_load_n(&g->p, __ATOMIC_ACQUIRE);
 }
+static void gfx_note_deferred(gval *g) {
+    if (!g) return;
+    // A NULL pipeline may also mean permanent creation failure. Count only
+    // genuine pending async draws, so the metric does not overstate the benefit.
+    pthread_mutex_lock(&g_mu);
+    int pending = g->busy;
+    pthread_mutex_unlock(&g_mu);
+    if (pending) atomic_fetch_add(&g_gfx_adeferred, 1);
+}
 VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int async_ok) {
     static gkey_full fk, last; static gval *last_g;
     // With vertex input dynamic state the key's static vertex input (va, vb: two thirds of it) stays zero: only what comes before it is hashed and compared with the
@@ -1157,11 +1171,22 @@ VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *
     size_t len = k->vin_static ? sizeof fk : offsetof(gkey_full, k.va);
     memset(&fk, 0, len);   // (the rest stays zero: vin_static is the device's, the same for every key)
     memcpy(fk.sh, sh, sizeof fk.sh); fk.layout = lay->layout; memcpy(&fk.k, k, len - offsetof(gkey_full, k));
-    if (last_g && !memcmp(&fk, &last, len)) return gval_use(last_g);
+    if (last_g && !memcmp(&fk, &last, len)) {
+        VkPipeline p = gval_use(last_g);
+        // The last-pipeline fast path must not bypass gfx_obtain's busy_wait
+        // if this draw has depth/stencil or another non-deferable side effect.
+        // A prior visual-only draw may have queued the SAME key asynchronously.
+        if (p || async_ok) {
+            if (!p && async_ok) gfx_note_deferred(last_g);
+            return p;
+        }
+    }
     int made;
     gval *g = gfx_obtain(&fk, fnv(&fk, len, 1469598103934665603ull), len, sh, lay, k, 0, async_ok, &made);
     memcpy(&last, &fk, len); last_g = g;
-    return gval_use(g);
+    VkPipeline p = gval_use(g);
+    if (!p && async_ok) gfx_note_deferred(g);
+    return p;
 }
 
 // ---------- Compute pipelines ----------
