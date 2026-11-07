@@ -202,6 +202,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0,
     if (row < bytes || img < row * rows) return;
     int ok = 0, from_gpu = 0;
     vka_img *im = vka_tex_acquire(t->serial);
+    if (!im) im = vka_cap_shared(t);  // another texture object over GPU-written storage
     if (im && im->inited && im->f.kind < 3 && im->samples == 1 &&
         level >= im->base && level - im->base < im->levels &&
         im->f.bpb == bpb && im->f.bw == bw && im->f.bh == bh) {
