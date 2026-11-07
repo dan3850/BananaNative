@@ -898,7 +898,7 @@ static int pw_pokopia_rank(const pwrec *r) {
 // code or builds pipelines on the NVN/game thread. ProgramSetShaders can fire
 // before pc_open_once loads the key file; retain its recent keys for init.
 static uint32_t pw_promote_locked(uint64_t key) {
-    if (!g_pw_order || !g_pw_urgent || !key) return 0;
+    if (!g_pw_order || !g_pw_urgent || !key || g_pw_claim_n >= g_pw_limit) return 0;
     uint32_t moved = 0;
     for (uint32_t i = g_pw_critical_n; i < g_pw_load_n; i++) {
         if (g_pw_claimed[i] || g_pw_urgent_flag[i]) continue;
@@ -1072,12 +1072,18 @@ static void *pw_main(void *a) {
         setpriority(PRIO_PROCESS, 0, 10);   // back under the game's threads if a waiting frame path raised it (busy_wait)
     }
     free(offs);
-    if (atomic_fetch_add(&g_pw_done, 1) + 1 == (uint32_t)g_pw_threads)
+    if (atomic_fetch_add(&g_pw_done, 1) + 1 == (uint32_t)g_pw_threads) {
         VLOG("prewarm: %u of %u pipeline keys in %.1f s on %d threads: %u made, %u already there, %u dropped (shaders no longer in the library, another device's keys); the frame path waited %.0f ms for them",
              (unsigned)(atomic_load(&g_pw_made) + atomic_load(&g_pw_had) + atomic_load(&g_pw_bad)), n, (now_ns() - g_pw_t0) / 1e9, g_pw_threads, (unsigned)atomic_load(&g_pw_made),
              (unsigned)atomic_load(&g_pw_had), (unsigned)atomic_load(&g_pw_bad), atomic_load(&g_pw_wait_ns) / 1e6);
-    if (g_pw_order) VLOG("Pokopia adaptive prewarm: %u known graphics keys promoted by shader registration, %u records claimed once",
-                         (unsigned)atomic_load(&g_pw_promoted_n), g_pw_claim_n);
+        if (g_pw_order) {
+            pthread_mutex_lock(&g_pw_qmu);
+            uint32_t claimed = g_pw_claim_n;
+            pthread_mutex_unlock(&g_pw_qmu);
+            VLOG("Pokopia adaptive prewarm: %u known graphics keys promoted by shader registration, %u records claimed once",
+                 (unsigned)atomic_load(&g_pw_promoted_n), claimed);
+        }
+    }
     return NULL;
 }
 // Pokopia's Poke Ball opening has three compute pipelines that took ~30 s
