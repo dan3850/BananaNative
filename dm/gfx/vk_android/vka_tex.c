@@ -663,7 +663,9 @@ static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int 
              d->target == NVN_TEXTURE_TARGET_2D && d->height == 1 &&
              ((d->width == 4 && d->format == 0x0a) ||
               (d->width == 2 && d->format == 0x2e)) &&
-             t->L.size <= 256 &&
+             // Block-linear NVN stores even a 4x1 R32F image in a 512-byte GOB.
+             // The previous <=256 condition never matched these textures.
+             t->L.size <= 4096 &&
              (d->flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE)) ==
                  (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE) &&
              !(pf & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) &&
@@ -678,7 +680,7 @@ static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int 
         want = ST_TRACK;
         static _Atomic unsigned seeded;
         if (atomic_fetch_add(&seeded, 1) < 16)
-            VLOG("sky-seed-small serial=%llu %ux%u format=%#x bytes=%llu sampled=%d poolflags=%#x: initial guest data uploaded instead of cleared",
+            VLOG("sky-seed-small serial=%llu %ux%u format=%#x bytes=%llu sampled=%d poolflags=%#x: initial guest data selected for upload instead of clear",
                 (unsigned long long)t->serial, d->width, d->height, d->format,
                 (unsigned long long)t->L.size, sampled, pf);
     }
