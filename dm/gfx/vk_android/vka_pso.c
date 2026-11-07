@@ -791,6 +791,20 @@ static void pw_explain(vka_shader *const sh[5], const vka_gkey *k, uint32_t klen
 }
 static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int *made);
 static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, int *made);
+// The first Pokopia playtest reached the Poke Ball scene after ~115 s and stalled
+// for ~98 s compiling these three compute shaders on Adreno 840. They are written
+// near the end of vk_pipelines.keys, so FIFO prewarm can reach them too late.
+// Only reprioritize keys ALREADY in that file; never create missing pipelines,
+// change library contents, or turn a cold first run into a mandatory compile.
+static int pw_pokopia_rank(const pwrec *r) {
+    if (r->kind != 1) return 3;
+    switch (r->key[0]) {
+    case 0x19391de31e77a42bull: return 0;
+    case 0x6bef3d23a8ddeafdull: return 1;
+    case 0x4fb03a033366f0b2ull: return 2;
+    default: return 3;
+    }
+}
 static void *pw_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // this thread (Linux: per-thread nice), under the game's threads
@@ -798,6 +812,29 @@ static void *pw_main(void *a) {
     size_t *offs = NULL;   // walked once by each thread to find the record of index i: built here (the list is small)
     uint32_t n = g_pw_load_n; offs = malloc((n ? n : 1) * sizeof *offs);
     if (offs) for (size_t o = 0, i = 0; i < n; i++) { offs[i] = o; pwrec r; memcpy(&r, g_pw_load + o, sizeof r); o += pw_size(&r); }
+    // Prioritize the three slow Pokopia compute pipelines before the general
+    // prewarm queue, preserving every record's original byte offset: pw_mark_bad
+    // uses that offset to flag a broken record in the persistent buffer.
+    if (offs && !strcmp(DM_GAME_ID, "0400A3A01EE4C000")) {
+        size_t *order = malloc((n ? n : 1) * sizeof *order);
+        if (order) {
+            uint32_t count = 0, hot = 0;
+            for (int priority = 0; priority < 4; priority++)
+                for (uint32_t i = 0; i < n; i++) {
+                    pwrec r; memcpy(&r, g_pw_load + offs[i], sizeof r);
+                    if (pw_pokopia_rank(&r) != priority) continue;
+                    order[count++] = offs[i];
+                    if (priority < 3) hot++;
+                }
+            if (count == n && hot) {
+                memcpy(offs, order, n * sizeof *offs);
+                static _Atomic int logged;
+                if (!atomic_exchange(&logged, 1))
+                    VLOG("Pokopia prewarm: %u previously-seen slow compute pipelines prioritized ahead of %u other keys", hot, n - hot);
+            }
+            free(order);
+        }
+    }
     for (;;) {
         pause_point();
         uint32_t i = atomic_fetch_add(&g_pw_next, 1);
