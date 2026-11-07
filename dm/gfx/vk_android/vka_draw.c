@@ -1266,6 +1266,35 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     }
     if (src1_used) VRED_ONCE("a SRC1 blend factor with no dual-source module (MOD_DUAL; the profile's dual_want.tsv) or no dualSrcBlend: the second source reads as zero");
 
+    // Pokopia sky investigation: the colour target serial 8192 was bit-for-bit
+    // identical at passes 22 and 28 despite 62 draws against it. All five
+    // fragment modules below declare location-0 colour output. These opt-in
+    // modes isolate depth/stencil versus colour masks/blending/alpha testing.
+    // No change to the normal path (DM_VK_SKY_PASS_TEST=0).
+    int sky_probe = 0;
+    if (fs && vka_frame() >= 4000) {
+        unsigned long long key = (unsigned long long)fs->key;
+        if (key == 0xa1d74f08252ddd39ull || key == 0xecf791af5d66d04eull ||
+            key == 0x8743dd823fc8e863ull || key == 0xcb656dd5c9a8bc81ull ||
+            key == 0x7e063e78dc7a3e1full) {
+            sky_probe = VKA_ENV("DM_VK_SKY_PASS_TEST", 0);
+            if (sky_probe > 3) sky_probe = 3;
+            static _Atomic unsigned n;
+            if (atomic_fetch_add(&n, 1) < 40)
+                VLOG("sky-pass-state frame=%llu fs=%016llx mode=%d colour=%u fmt=%u mask=%#x blend=%u depthfmt=%u stencilfmt=%u depthtest=%d depthwrite=%d depthfunc=%d stenciltest=%d cull=%d alpha=%d a2c=%d",
+                    (unsigned long long)vka_frame(), key, sky_probe,
+                    R.ncolor, (unsigned)R.cf[0],
+                    (unsigned)k.att[0].mask, (unsigned)k.att[0].en,
+                    (unsigned)R.df, (unsigned)R.sf, d->ds.dt, d->ds.dw, d->ds.df,
+                    d->ds.st, d->poly.cull, k.alpha_func, d->ms.a2c);
+        }
+    }
+    if (sky_probe >= 2 && R.ncolor && fs) {
+        k.att[0].mask = 15;   // force RGBA writes only for candidate shaders
+        k.att[0].en = 0;      // bypass colour blend, preserve original attachment format
+    }
+    if (sky_probe >= 3) k.alpha_func = 0; // bypass specialised alpha test
+
     PT(3);
     if (!mesh) vin_build(d, sh[0], &k);
     PT(4);
@@ -1311,11 +1340,11 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (mesh) DY.topo = DY.pr = ~0u;
     else DY_SET1(topo, (uint32_t)(topo), vk.vkCmdSetPrimitiveTopology(g_cb, DY.topo));
     int hd = R.df != VK_FORMAT_UNDEFINED, hs = R.sf != VK_FORMAT_UNDEFINED;
-    DY_SET1(dt, (uint32_t)(hd && d->ds.dt), vk.vkCmdSetDepthTestEnable(g_cb, DY.dt));
-    DY_SET1(dw, (uint32_t)(hd && d->ds.dt && d->ds.dw), vk.vkCmdSetDepthWriteEnable(g_cb, DY.dw));
+    DY_SET1(dt, (uint32_t)(hd && d->ds.dt && !sky_probe), vk.vkCmdSetDepthTestEnable(g_cb, DY.dt));
+    DY_SET1(dw, (uint32_t)(hd && d->ds.dt && d->ds.dw && !sky_probe), vk.vkCmdSetDepthWriteEnable(g_cb, DY.dw));
     DY_SET1(dc, (uint32_t)(d->ds.df >= 1 && d->ds.df <= 8 ? (VkCompareOp)(d->ds.df - 1) : VK_COMPARE_OP_ALWAYS), vk.vkCmdSetDepthCompareOp(g_cb, DY.dc));
     DY_SET1(dbt, (uint32_t)(VK_FALSE), vk.vkCmdSetDepthBoundsTestEnable(g_cb, DY.dbt));
-    DY_SET1(stt, (uint32_t)(hs && d->ds.st), vk.vkCmdSetStencilTestEnable(g_cb, DY.stt));
+    DY_SET1(stt, (uint32_t)(hs && d->ds.st && !sky_probe), vk.vkCmdSetStencilTestEnable(g_cb, DY.stt));
     #define SOP(x) ((x) >= 1 && (x) <= 8 ? (VkStencilOp)((x) - 1) : VK_STENCIL_OP_KEEP)
     #define SCMP(x) ((x) >= 1 && (x) <= 8 ? (VkCompareOp)((x) - 1) : VK_COMPARE_OP_ALWAYS)
     { uint32_t so[8] = {SOP(d->ds.fail_f), SOP(d->ds.zpass_f), SOP(d->ds.zfail_f), SCMP(d->ds.sf_f), SOP(d->ds.fail_b), SOP(d->ds.zpass_b), SOP(d->ds.zfail_b), SCMP(d->ds.sf_b)};
