@@ -23,6 +23,19 @@ KEYS = (
     "4e7e5539bd1600d2",  # light-effects pass
     "97b3b56827e33df2",  # late composite
     "ed5f4c6386ca621d",  # late composite
+    # After checking the first eight, the MRT shader pair at pass 7 and
+    # the lighting shaders at pass 22 do not by themselves reveal the sky
+    # source. These keys come from the real world-scene frame 4000 log:
+    "0f850632b44b024d",  # pass 13, post-MRT
+    "a1f8d347156ef98e",  # pass 20, full-resolution intermediate
+    "f2e937146230959a",  # pass 21, full-resolution intermediate
+    "a1d74f08252ddd39",  # passes 23 and 28
+    "8743dd823fc8e863",  # pass 24, first FS among 7 draws
+    "cb656dd5c9a8bc81",  # pass 24, last FS among 7 draws
+    "7e063e78dc7a3e1f",  # pass 27, 51 draws
+    "ecf791af5d66d04e",  # pass 28, first FS
+    "c084743500faed36",  # pass 26, depth-only
+    "09be319577b24ee0",  # pass 37, full-resolution late effect
 )
 BIND = struct.Struct("<BBHBBHhHBBhHHI")
 DEFAULT_PACK = Path.home() / "storage/downloads/Pokopia-Pack-Shaders-Novos"
