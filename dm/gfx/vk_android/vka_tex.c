@@ -1373,7 +1373,7 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
 // and layer) are cut into runs of block rows (nvn_deswizzle_rows, at least ~64 KB each) that the helpers and the calling thread take in turn; the copies are recorded after
 // all of them, in the same order as before. Only uploads of at least DM_VK_UPLOAD_MT_MIN bytes (default 256 KB): the first uploads of a level's textures came in loading
 // frames, 1-93 textures a frame, all deswizzled on the replay thread one after another
-typedef struct { const nvn_texdesc *d; const uint8_t *src; uint8_t *dst; size_t pitch; uint32_t lv, ly, y0, y1; _Atomic int *bad; } up_part;   // bad: its piece's flag
+typedef struct { const nvn_deswizzle_ctx *geo; const uint8_t *src; uint8_t *dst; size_t pitch; uint32_t y0, y1; _Atomic int *bad; } up_part;   // bad: its piece's flag
 // A part is claimed by compare-and-swap on next while next < n: a helper that wakes late, or comes back from the last batch, can only claim a part of the batch being set up
 // once it is complete (p, then next = 0, then n; n = 0 between batches)
 static struct { pthread_mutex_t mu; pthread_cond_t cv, done_cv; _Atomic(up_part *) p; _Atomic uint32_t n, next, done; _Atomic int fail; uint64_t gen; int nth; } UP = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
@@ -1384,7 +1384,7 @@ static void up_run(void) {   // take parts until none is left
         if (i >= n) return;
         if (!atomic_compare_exchange_weak(&UP.next, &i, i + 1)) continue;
         up_part *q = &atomic_load(&UP.p)[i];
-        if (nvn_deswizzle_rows(q->d, q->lv, q->ly, q->src, q->dst, q->pitch, q->y0, q->y1)) { atomic_store(&UP.fail, 1); atomic_store(q->bad, 1); }
+        if (nvn_deswizzle_rows_prepared(q->geo, q->src, q->dst, q->pitch, q->y0, q->y1)) { atomic_store(&UP.fail, 1); atomic_store(q->bad, 1); }
         if (atomic_fetch_add(&UP.done, 1) + 1 == n) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.done_cv); pthread_mutex_unlock(&UP.mu); }
     }
 }
@@ -1426,7 +1426,7 @@ static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *
     }
     int minb = VKA_ENV("DM_VK_UPLOAD_MT_MIN", 256 << 10);
     if (total < (uint64_t)(minb > 0 ? minb : 1) || npieces > 4096 || VKA_ENV("DM_VK_UPLOAD_MT", 3) <= 0) return 0;
-    typedef struct { vka_span s; uint32_t lv, ly, w, h, z, bx, by; size_t pitch; _Atomic int bad; } piece_t;
+    typedef struct { vka_span s; uint32_t lv, ly, w, h, z, bx, by; size_t pitch; _Atomic int bad; nvn_deswizzle_ctx geo; } piece_t;
     piece_t *pc = malloc(npieces * sizeof *pc); up_part *parts = NULL; uint32_t np = 0, cap = 0;
     if (!pc) return 0;
     uint32_t k = 0;
@@ -1437,18 +1437,22 @@ static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *
         if (rows < 0 || (uint32_t)rows != by) { free(pc); free(parts); return 0; }   // (a shape the serial path reports)
         for (uint32_t ly = 0; ly < im->layers; ly++, k++) {
             piece_t *q = &pc[k]; *q = (piece_t){{0}, lv, ly, w, h, z, bx, by, pitch, 0};
+            // One immutable layout per level/layer, shared by all row tasks.
+            // The 64-KiB chunks previously recalculated nvn_tex_layout and
+            // tile geometry separately on every worker thread.
+            if (nvn_deswizzle_prepare(d, lv, ly, &q->geo)) { free(pc); free(parts); return 0; }
             if (!vka_scratch(piece, 16, &q->s)) goto cut;   // (no scratch: as the serial path, the pieces before it are uploaded)
             // Runs of block rows of at least ~64 KB (all slices of a 3D level in each)
             uint32_t per = (uint32_t)((65536 + pitch * z - 1) / (pitch * z)); if (!per) per = 1;
             for (uint32_t y = 0; y < by; y += per) {
                 if (np == cap) { cap = cap ? cap * 2 : 64; up_part *n2 = realloc(parts, cap * sizeof *parts); if (!n2) { free(pc); free(parts); return 0; } parts = n2; }
-                parts[np++] = (up_part){d, t->mem, q->s.ptr, pitch, lv, ly, y, y + per < by ? y + per : by, &q->bad};
+                parts[np++] = (up_part){&q->geo, t->mem, q->s.ptr, pitch, y, y + per < by ? y + per : by, &q->bad};
             }
         }
     }
 cut:;
     int fail = 0;
-    if (!up_parallel(parts, np, &fail)) { for (uint32_t i = 0; i < np; i++) if (nvn_deswizzle_rows(parts[i].d, parts[i].lv, parts[i].ly, parts[i].src, parts[i].dst, parts[i].pitch, parts[i].y0, parts[i].y1)) { fail = 1; *parts[i].bad = 1; } }
+    if (!up_parallel(parts, np, &fail)) { for (uint32_t i = 0; i < np; i++) if (nvn_deswizzle_rows_prepared(parts[i].geo, parts[i].src, parts[i].dst, parts[i].pitch, parts[i].y0, parts[i].y1)) { fail = 1; *parts[i].bad = 1; } }
     free(parts);
     // A piece that could not be deswizzled ends the upload there, as on the serial path: the pieces before it are copied, it and those after it are not
     if (fail) VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target);
