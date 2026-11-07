@@ -1289,7 +1289,16 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
         if (im) big_share(im, t);   // (another texture object of the same storage and shape: DM_VK_BIGIMG_MB diagnostic)
         uint32_t vmin = 0, base = sparse_sampled(t, &f) ? sparse_base(t->pool, t->mem, &t->d, &t->L, &vmin) : 0;
         int mode = 0;
-        if (!im) { mode = first_mode(t, &f, cpuw_take(t->serial, 0)); g_zwant = mode == ST_ZERO; im = img_create(t, &f, base); g_zwant = 0; }
+        if (!im) {
+            mode = first_mode(t, &f, cpuw_take(t->serial, 0));
+            if ((uint64_t)VKA_ENV("DM_VK_CUBE_TRACE_SERIAL", 0) == t->serial)
+                VLOG("cubetrace first use serial=%llu frame=%llu mode=%d sampled=%d flags=%#x target=%d dims=%ux%ux%u levels=%u storage_bytes=%llu memory=%s",
+                     (unsigned long long)t->serial, (unsigned long long)vka_frame(),
+                     mode, g_first_sampled, t->d.flags, t->d.target,
+                     t->d.width, t->d.height, t->d.depth, t->d.levels,
+                     (unsigned long long)t->L.size, t->mem ? "present" : "absent");
+            g_zwant = mode == ST_ZERO; im = img_create(t, &f, base); g_zwant = 0;
+        }
         if (im && !im->inited) {
             im->vmin = vmin;
             if (g_nlive == g_livecap) { g_livecap = g_livecap ? g_livecap * 2 : 256; g_live = realloc(g_live, (size_t)g_livecap * sizeof *g_live); }
@@ -1544,6 +1553,11 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
     if (!im->gpu_owned && im->m.size >= big_min()) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 64)   // large images: the first GPU write (DM_VK_BIGIMG_MB)
         VLOG("large image serial %llu %ux%u layers %u format %#x (%.1f MiB): first GPU write at frame %llu (%s:%d), sampled by %u draws before, %u other textures over its storage", (unsigned long long)im->serial,
              im->w, im->h, im->layers, im->d.format, im->m.size / 1048576.0, (unsigned long long)vka_frame(), file, line, im->nsamp, im->novl); }
+    if ((uint64_t)VKA_ENV("DM_VK_CUBE_TRACE_SERIAL", 0) == im->serial && !im->gpu_owned) {
+        VLOG("cubetrace first GPU write serial=%llu frame=%llu source=%s:%d mode=%u from_mem=%d layers=%u levels=%u",
+             (unsigned long long)im->serial, (unsigned long long)vka_frame(), file, line,
+             (unsigned)im->mode, im->from_mem, im->layers, im->levels);
+    }
     im->gpu_owned = 1;
     if ((im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1) {
         if (g_nwb == g_wbcap) { g_wbcap = g_wbcap ? 2 * g_wbcap : 32; g_wb = realloc(g_wb, (size_t)g_wbcap * sizeof *g_wb); }
@@ -1973,6 +1987,11 @@ void vka_tex_id_desc(int id, char *b, size_t n) {
              (unsigned long long)e.t.serial, e.t.d.target, e.t.d.format, e.t.d.width, e.t.d.height, e.t.d.depth, e.t.d.levels, e.t.d.flags, e.img ? " (image slot)" : "",
              v && v->set_target ? v->target : -1, v && v->set_layers ? v->min_layer : 0, v && v->set_layers ? v->nlayers : 0, v && v->set_format ? v->format : 0,
              im ? "made" : m ? "refused" : "not made", im ? im->w : 0, im ? im->h : 0, im ? im->depth : 0, im ? im->layers : 0, im ? im->usage : 0);
+    if (im && im->serial == (uint64_t)VKA_ENV("DM_VK_CUBE_TRACE_SERIAL", 0)) {
+        size_t used = strlen(b);
+        if (used < n) snprintf(b + used, n - used, "; cubetrace mode=%u from_mem=%d gpu_owned=%d track=%d inited=%d zero_shared=%d",
+                               (unsigned)im->mode, im->from_mem, im->gpu_owned, im->track, im->inited, im->m.z != 0);
+    }
 }
 int vka_tex_id_target(int id) {
     pthread_mutex_lock(&g_tmu);
