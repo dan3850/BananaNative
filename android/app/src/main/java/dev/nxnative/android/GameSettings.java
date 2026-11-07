@@ -25,8 +25,11 @@ final class GameSettings {
         String id = g.titleId;
         box.addView(Ui.small(a, "For this game only, from its next start. Default follows Settings."));
         Profile prof = Profile.of(id);
-        if (prof != null && prof.hasResolution())   // only where it does something: a profile with window_fn or graphics_scale rows
+        if (prof != null && prof.hasResolution()) { // profile supplies window_fn or graphics_scale rows
             Ui.add(box, new Ui.Setting(a, "🖼️", "Game resolution", v -> resolution(a, g, again)).value(windowLabel(a, id)).chevron(a).view, 8);
+            if (id.equals("0400A3A01EE4C000"))
+                Ui.add(box, Ui.small(a, "Pokopia: 720p is an experimental graphics profile (handheld, scale tier 2). Actual render size depends on the game; select Original to remove the override."), 2);
+        }
         if (Prefs.ownRate(a, id)) {   // the host found no limiter it can hold for this game: choices would do nothing
             Ui.Setting fixed = new Ui.Setting(a, "⏱️", "Frame rate cap", null).value("This game picks its own frame rate");
             fixed.view.setClickable(false);
