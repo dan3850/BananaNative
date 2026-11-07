@@ -1303,14 +1303,15 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     // shaders synchronous to preserve the already-correct background.
     // Other eligible draws may briefly pop in: DM_VK_GFX_ASYNC=0 restores the
     // original fully synchronous behaviour without an APK rebuild.
-    uint64_t fskey = sh[1] ? sh[1]->key : 0;
-    int sky_shader = fskey == 0xa1d74f08252ddd39ull || fskey == 0xecf791af5d66d04eull ||
-                     fskey == 0x8743dd823fc8e863ull || fskey == 0xcb656dd5c9a8bc81ull ||
-                     fskey == 0x7e063e78dc7a3e1full;
-    int gfx_async_safe = !strcmp(DM_GAME_ID, "0400A3A01EE4C000") &&
-                         VKA_ENV("DM_VK_GFX_ASYNC", 0) && !mesh &&
-                         !d->tf_on && !d->rast_discard && !d->ds.dw &&
-                         !d->ds.st && !sky_shader && !draw_writes(sh, d);
+    int gfx_async_safe = 0;
+    if (!strcmp(DM_GAME_ID, "0400A3A01EE4C000") && VKA_ENV("DM_VK_GFX_ASYNC", 0)) {
+        uint64_t fskey = sh[1] ? sh[1]->key : 0;
+        int sky_shader = fskey == 0xa1d74f08252ddd39ull || fskey == 0xecf791af5d66d04eull ||
+                         fskey == 0x8743dd823fc8e863ull || fskey == 0xcb656dd5c9a8bc81ull ||
+                         fskey == 0x7e063e78dc7a3e1full;
+        gfx_async_safe = !mesh && !d->tf_on && !d->rast_discard &&
+                         !d->ds.dw && !d->ds.st && !sky_shader && !draw_writes(sh, d);
+    }
     VkPipeline p = vka_gfx_pipeline(sh, &lay, &k, gfx_async_safe);
     if (!p) { g_skipped++; return; }
     if (!DY.valid || !g_dyn_filter || DY.pipe != p) { vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.vin_stale = 1; }
