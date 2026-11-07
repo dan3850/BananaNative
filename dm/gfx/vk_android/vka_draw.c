@@ -1280,7 +1280,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
             sky_probe = VKA_ENV("DM_VK_SKY_PASS_TEST", 0);
             if (sky_probe > 3) sky_probe = 3;
             static _Atomic unsigned n;
-            if (atomic_fetch_add(&n, 1) < 40)
+            if (sky_probe > 0 && atomic_fetch_add(&n, 1) < 40)
                 VLOG("sky-pass-state frame=%llu fs=%016llx mode=%d colour=%u fmt=%u mask=%#x blend=%u depthfmt=%u stencilfmt=%u depthtest=%d depthwrite=%d depthfunc=%d stenciltest=%d cull=%d alpha=%d a2c=%d",
                     (unsigned long long)vka_frame(), key, sky_probe,
                     R.ncolor, (unsigned)R.cf[0],
