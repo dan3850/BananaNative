@@ -208,8 +208,8 @@ static void rt_dump_flush(unsigned slot) {
         for (size_t j = 0; j < n; j++) zero += p->hb.p[j] == 0;
         if (dir[0]) {
             char stem[900], name[940];
-            snprintf(stem, sizeof stem, "%s/frame-%llu-pass-%llu-serial-%llu", dir,
-                (unsigned long long)p->frame, (unsigned long long)p->pass, (unsigned long long)p->serial);
+            snprintf(stem, sizeof stem, "%s/frame-%llu-pass-%llu-serial-%llu-lv-%u-layer-%u", dir,
+                (unsigned long long)p->frame, (unsigned long long)p->pass, (unsigned long long)p->serial, p->level, p->layer);
             snprintf(name, sizeof name, "%s.bin", stem);
             FILE *f = fopen(name, "wb");
             if (f) { fwrite(p->hb.p, 1, n, f); fclose(f); }
