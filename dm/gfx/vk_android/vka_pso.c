@@ -848,19 +848,32 @@ static void pw_explain(vka_shader *const sh[5], const vka_gkey *k, uint32_t klen
 }
 static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int async_ok, int *made);
 static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, int *made);
-// The first Pokopia playtest reached the Poke Ball scene after ~115 s and stalled
-// for ~98 s compiling these three compute shaders on Adreno 840. They are written
-// near the end of vk_pipelines.keys, so FIFO prewarm can reach them too late.
-// Only reprioritize keys ALREADY in that file; never create missing pipelines,
-// change library contents, or turn a cold first run into a mandatory compile.
+// Priorities learned from actual Pokopia Adreno 840 cold and warm logs:
+// 3 compute shaders cost 30-42 s each, and the five graphics pairs below
+// cost 247-505 ms each when their Vulkan cache entry was missing.
+// Prioritize only EXACT shader+state records already in vk_pipelines.keys
+// (or the pack's persistent pso_pokopia.keys). This does not guess new
+// pipeline states, skip draws, or precompile extra unused combinations.
 static int pw_pokopia_rank(const pwrec *r) {
-    if (r->kind != 1) return 3;
-    switch (r->key[0]) {
-    case 0x19391de31e77a42bull: return 0;
-    case 0x6bef3d23a8ddeafdull: return 1;
-    case 0x4fb03a033366f0b2ull: return 2;
-    default: return 3;
+    if (r->kind == 1) {
+        switch (r->key[0]) {
+        case 0x19391de31e77a42bull: return 0;
+        case 0x6bef3d23a8ddeafdull: return 1;
+        case 0x4fb03a033366f0b2ull: return 2;
+        default: return 4;
+        }
     }
+    if (r->kind == 0) {
+        // Stage keys are NVN stage order: 0 vertex, 1 fragment.
+        const uint64_t vs = r->key[0], fs = r->key[1];
+        if ((vs == 0x27a9eca8f69bd507ull && fs == 0x4bb1d4432b81334bull) ||
+            (vs == 0xb639e7c91c3eacfeull && fs == 0xa3305c931b85d38aull) ||
+            (vs == 0x3e3d60de395922e3ull && fs == 0x5cad2e15d45314c1ull) ||
+            (vs == 0x3e3d60de395922e3ull && fs == 0x326f1378a60247a0ull) ||
+            (vs == 0xdd72891a036ac49eull && fs == 0x5cad2e15d45314c1ull))
+            return 3;
+    }
+    return 4;
 }
 static void *pw_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-prewarm");
@@ -869,25 +882,27 @@ static void *pw_main(void *a) {
     size_t *offs = NULL;   // walked once by each thread to find the record of index i: built here (the list is small)
     uint32_t n = g_pw_load_n; offs = malloc((n ? n : 1) * sizeof *offs);
     if (offs) for (size_t o = 0, i = 0; i < n; i++) { offs[i] = o; pwrec r; memcpy(&r, g_pw_load + o, sizeof r); o += pw_size(&r); }
-    // Prioritize the three slow Pokopia compute pipelines before the general
-    // prewarm queue, preserving every record's original byte offset: pw_mark_bad
-    // uses that offset to flag a broken record in the persistent buffer.
+    // Prioritize known slow compute and graphics pipelines before the general
+    // prewarm queue. Preserve each record's original byte offset so pw_mark_bad
+    // still flags the correct record in the persistent buffer.
     if (offs && !strcmp(DM_GAME_ID, "0400A3A01EE4C000")) {
         size_t *order = malloc((n ? n : 1) * sizeof *order);
         if (order) {
-            uint32_t count = 0, hot = 0;
-            for (int priority = 0; priority < 4; priority++)
+            uint32_t count = 0, hot_compute = 0, hot_gfx = 0;
+            for (int priority = 0; priority < 5; priority++)
                 for (uint32_t i = 0; i < n; i++) {
                     pwrec r; memcpy(&r, g_pw_load + offs[i], sizeof r);
                     if (pw_pokopia_rank(&r) != priority) continue;
                     order[count++] = offs[i];
-                    if (priority < 3) hot++;
+                    if (priority < 3) hot_compute++;
+                    else if (priority == 3) hot_gfx++;
                 }
-            if (count == n && hot) {
+            if (count == n && (hot_compute || hot_gfx)) {
                 memcpy(offs, order, n * sizeof *offs);
                 static _Atomic int logged;
                 if (!atomic_exchange(&logged, 1))
-                    VLOG("Pokopia prewarm: %u previously-seen slow compute pipelines prioritized ahead of %u other keys", hot, n - hot);
+                    VLOG("Pokopia prewarm: %u slow compute and %u slow graphics keys prioritized ahead of %u others",
+                         hot_compute, hot_gfx, n - hot_compute - hot_gfx);
             }
             free(order);
         }
