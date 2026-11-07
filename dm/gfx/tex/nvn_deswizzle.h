@@ -11,6 +11,18 @@
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch);
 // The same for block rows [y0, y1) of every slice only, each at its place in dst_linear (several threads can decode one level in parts: the Vulkan replay's uploads)
 int nvn_deswizzle_rows(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch, uint32_t y0, uint32_t y1);
+// Prepared immutable block-linear geometry: compute level/layer layout once,
+ // then reuse across parallel row slices. No texture bytes are copied or
+ // changed by preparing this. ctx is read-only for worker threads.
+typedef struct {
+    uint32_t row_bytes, rows, slices, laid_out_bytes;
+    uint64_t base;
+    unsigned tile_h, tile_d, switch2;
+} nvn_deswizzle_ctx;
+int nvn_deswizzle_prepare(const nvn_texdesc *d, unsigned level, unsigned layer, nvn_deswizzle_ctx *ctx);
+int nvn_deswizzle_rows_prepared(const nvn_deswizzle_ctx *ctx, const void *src_storage, void *dst_linear,
+                               size_t dst_pitch, uint32_t y0, uint32_t y1);
+
 // Block rows of a level (one slice), or -1 where nvn_deswizzle refuses the texture
 int nvn_deswizzle_block_rows(const nvn_texdesc *d, unsigned level);
 // A level's bands (not 3D): band k is block rows [k * band_rows, (k + 1) * band_rows) (one row of GOB blocks), stored in bytes [k * band_bytes, (k + 1) * band_bytes) from the level
