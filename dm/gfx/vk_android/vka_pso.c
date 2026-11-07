@@ -751,7 +751,10 @@ static void pw_load(void) {
     }
     if (skipped) VLOG("prewarm list %s: %u records with impossible values skipped (dropped at the next save)", g_pw_path, skipped);
     g_pw_load = malloc(g_pw_len ? g_pw_len : 1); if (g_pw_load) { memcpy(g_pw_load, g_pw_buf, g_pw_len); g_pw_load_len = g_pw_len; g_pw_load_n = g_pw_n; }
-    if (from_seed && g_pw_load_n) g_pw_dirty = 1;   // mirror the verified seed back to the app's private list on the next save
+    // An existing app-local cache must also seed a previously empty pack:
+    // updating the APK should not require the player to trigger a new pipeline.
+    if (g_pw_load_n && (from_seed || (g_pw_seed_path[0] && access(g_pw_seed_path, R_OK))))
+        g_pw_dirty = 1;
     pthread_mutex_unlock(&g_pw_mu);
     free(d);
     VLOG("prewarm list %s: %u pipeline keys of earlier runs%s", from_seed ? g_pw_seed_path : g_pw_path, g_pw_load_n, from_seed ? " (persistent manifest)" : "");
