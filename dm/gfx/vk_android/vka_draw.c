@@ -161,6 +161,7 @@ static struct {
     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
     uint64_t rt_first_fs, rt_last_fs, rt_fs[12]; uint32_t rt_draws, rt_nfs;  // DM_VK_RT_CAPTURE_AT: shaders seen inside this pass
+    VkViewport rt_vp; VkRect2D rt_sc;   // first executed draw's viewport/scissor for diagnosing partial images
 } R;
 // Clears waiting for the pass of their targets (vka_rp_clear), in order: the next draw over the same targets opens its pass with them (loadOp CLEAR, or vkCmdClearAttachments),
 // anything else does them outside a pass first (pc_flush), as before
@@ -176,7 +177,7 @@ static void pc_flush(void) { int n = PC.n; PC.n = 0; for (int i = 0; i < n; i++)
 // capture starts, to reach late composition passes. DM_VK_RT_CAPTURE_STRIDE=2
 // (default) samples every second eligible pass after that offset.
 // PNGs and raw GPU bytes live in $DM_TEMP/sky-rt (or $DM_VK_RTDUMP_DIR).
-enum { RTD_MAX = 24, RTD_PER_SLOT = 4 };
+enum { RTD_MAX = 24, RTD_PER_SLOT = 8 };  // 4 previously filled before final composite passes 20/22/23
 typedef struct {
     vcap_hbuf hb;
     uint64_t frame, pass, serial, first_fs, last_fs, fs[12];
@@ -248,6 +249,10 @@ static void rt_dump_pass(void) {
             (unsigned long long)vka_frame(), (unsigned long long)pass, R.nci, R.area.extent.width, R.area.extent.height,
             (unsigned long long)(im ? im->serial : 0), im ? im->w : 0, im ? im->h : 0, R.rt_draws,
             (unsigned long long)R.rt_first_fs, (unsigned long long)R.rt_last_fs);
+        VLOG("rtdump pass-view frame=%llu pass=%llu viewport=(%.1f,%.1f %.1fx%.1f) scissor=(%d,%d %ux%u)",
+            (unsigned long long)vka_frame(), (unsigned long long)pass,
+            R.rt_vp.x, R.rt_vp.y, R.rt_vp.width, R.rt_vp.height,
+            R.rt_sc.offset.x, R.rt_sc.offset.y, R.rt_sc.extent.width, R.rt_sc.extent.height);
     }
     if (pass <= (uint64_t)skip || ((pass - (uint64_t)skip - 1) % stride)) return;
     if (rt_dump[g_slot].n == RTD_PER_SLOT) return;
@@ -255,12 +260,24 @@ static void rt_dump_pass(void) {
         vka_img *im = R.cim[i];
         if (!im || !im->img || !im->inited || im->samples != 1 ||
             !(im->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || im->f.kind >= 3 ||
-            im->f.bw != 1 || im->f.bh != 1 || !im->f.bpb) continue;
+            im->f.bw != 1 || im->f.bh != 1 || !im->f.bpb) {
+            if (VKA_ENV("DM_VK_RT_CAPTURE_LOG", 0) && pass <= 48)
+                VLOG("rtdump skip-target pass=%llu attachment=%d serial=%llu initialized=%d samples=%u usage=%#x kind=%d block=%ux%u bpb=%u",
+                    (unsigned long long)pass, i, (unsigned long long)(im ? im->serial : 0), im ? im->inited : 0,
+                    im ? im->samples : 0, im ? (unsigned)im->usage : 0u, im ? im->f.kind : -1,
+                    im ? im->f.bw : 0, im ? im->f.bh : 0, im ? im->f.bpb : 0);
+            continue;
+        }
         uint32_t lv = R.clv[i], ly = R.cl0[i];
         if (lv >= im->levels || ly >= im->layers) continue;
         uint32_t w = im->w >> lv ? im->w >> lv : 1;
         uint32_t h = im->h >> lv ? im->h >> lv : 1;
-        if (w < 256 || h < 144) continue;
+        if (w < 256 || h < 144) {
+            if (VKA_ENV("DM_VK_RT_CAPTURE_LOG", 0) && pass <= 48)
+                VLOG("rtdump skip-small pass=%llu serial=%llu %ux%u",
+                    (unsigned long long)pass, (unsigned long long)im->serial, w, h);
+            continue;
+        }
         uint64_t bytes = (uint64_t)w * h * im->f.bpb;
         if (!bytes || bytes > 16ull * 1024 * 1024) continue;
         rt_dump_item *p = &rt_dump[g_slot].item[rt_dump[g_slot].n];
@@ -1225,6 +1242,10 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     { int xs = VKA_ENV("DM_VK_XP_SCISSOR", 0);   // experiment (wrong picture): every draw's scissor cut to xs x xs pixels, to split a pass's GPU time into per-pixel and per-draw work
       if (xs > 0) { if (scr.extent.width > (uint32_t)xs) scr.extent.width = (uint32_t)xs; if (scr.extent.height > (uint32_t)xs) scr.extent.height = (uint32_t)xs; } }
     DY_SET(sc, scr, vk.vkCmdSetScissor(g_cb, 0, 1, &scr));
+    if (VKA_ENV("DM_VK_RT_CAPTURE_LOG", 0) && R.rt_draws == 0) {
+        R.rt_vp = vp;
+        R.rt_sc = scr;
+    }
     // Rasterizer and depth / stencil
     DY_SET1(cull, (uint32_t)(d->poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : d->poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : d->poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE), vk.vkCmdSetCullMode(g_cb, DY.cull));
     DY_SET1(ff, (uint32_t)((d->poly.front == NVN_FRONT_FACE_CCW) != vka_queue_origin_ll() ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE), vk.vkCmdSetFrontFace(g_cb, DY.ff));   // as nvn_mtl.m's winding
