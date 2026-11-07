@@ -23,6 +23,19 @@ modules	main subsdk0 sdk
 romfs_marker	motor_asset_re/KIDS_PLATFORM_OUNCE/root.rdb
 zip_store	.fdata:.file:.rdb:.webm:.metallib
 
+# ---- Android experimental Game resolution ----
+# Unlike DKB, this game's fixed window-size getter functions have not been
+# identified. Do not set window_fn or claim DM_WINDOW_SIZE works here.
+# The launcher can still offer resolution profiles by answering the Switch 2
+# oe graphics-scale API. The existing console/scale 1 setting is the game's
+# observed default (NVN window 1920x1080 on Adreno); scale 2 + handheld is
+# an EXPERIMENTAL lower-cost preset borrowed from the Mario Kart World tier
+# mechanism, NOT a proven 1280x720 render size in Pokopia. Verify the game's
+# logged NVN WindowInitialize, render targets and FPS on-device before claiming
+# an actual resolution/performance improvement. 'original' adds no overrides.
+graphics_scale	1920x1080	1	console
+graphics_scale	1280x720	2	handheld
+
 # ---- Memory ----
 # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The game takes all of it with SetHeapSize (8.92 GB) and makes 4,988 MiB of memory pools in it; the opening touches 4.6 GB (phone, README.md Memory). The NPDM declares no system resource (META +0x14 = 0): no virtual address memory.
 # 256 MB in front + 256 MB alias region + 256 MB stack region + 9 GB heap region
