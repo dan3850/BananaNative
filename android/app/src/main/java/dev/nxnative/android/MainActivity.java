@@ -3,6 +3,7 @@ package dev.nxnative.android;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.res.Configuration;
 import android.net.Uri;
@@ -35,8 +36,8 @@ import java.util.List;
  * kept away from Play. With no game, a single card says what to do and has Add game. "Add game" takes a dump folder or .nup of any game this APK has a profile for
  * (Profile: one host per game), or a folder that holds several (all added, one summary: addAll): the best pack PackFind finds (the picked pack folder, the app's,
  * beside the game, &lt;id&gt;-work/&lt;any&gt; up to three folders above it) is used when it fits or only needs the automatic shader update, else the app offers to
- * prepare one on the phone (or a card with Prepare, from a folder of games). A game without a profile in this APK is refused with a sentence (Profile.missing),
- * never started.
+ * prepare one on the phone (or a card with Prepare, from a folder of games). A game without a native host profile can be added for
+ * experimental diagnostics (its title ID, dump and existing pack are inspected), but it cannot launch or Prepare until the host exists.
  * <p>
  * Each page sits in one ScrollView over the drifting bananas, so it scrolls on any screen (the folded phone's outer display, landscape, a split window), at a
  * readable width, centered on a wide window. The activity handles rotation itself (configChanges), so a size change builds the page again (onConfigurationChanged).
@@ -166,6 +167,11 @@ public final class MainActivity extends Activity {
         help.addView(new Ui.Setting(this, "📋", "Readiness check", v -> startActivityForResult(new Intent(this, ReadinessActivity.class), ReadinessActivity.REQUEST))
                 .value("Can this phone run your games?").chevron(this).view);   // (ReadinessActivity.java)
         help.addView(new Ui.Setting(this, "🧪", "Graphics self-test", v -> startActivity(new Intent(this, SelftestActivity.class))).value("Needs no game").chevron(this).view);
+        help.addView(new Ui.Setting(this, "🔬", "Experimental games", v ->
+                new AlertDialog.Builder(this).setTitle("Experimental games")
+                        .setMessage("Add game accepts .nup files and game dump folders even when their title ID is not supported yet. Unknown games appear in your library with a Diagnostics button, showing what is missing.\n\nA game without a compiled native host cannot launch or Prepare. Your existing playable games, packs and saves are not changed.")
+                        .setPositiveButton("OK", null).show())
+                .value("Unknown titles · diagnostics only").chevron(this).view);
         help.addView(new Ui.Setting(this, "📨", "Share log", v -> shareLog()).value("The newest log").chevron(this).view);
 
         Ui.add(content, Ui.section(this, "About"), Ui.SECTION_GAP);
@@ -330,14 +336,16 @@ public final class MainActivity extends Activity {
         name.setEllipsize(TextUtils.TruncateAt.END);
         info.addView(name);
         boolean other = Profile.of(g.titleId) == null;   // no profile in this APK: it cannot run here (Profile.missing says why)
-        TextView st = other ? Ui.status(this, "Not supported", R.color.bn_danger) : Ui.status(this, "Checking…", R.color.bn_text_2);
+        TextView st = other ? Ui.status(this, "Experimental · native host missing", R.color.bn_accent) : Ui.status(this, "Checking…", R.color.bn_text_2);
         LinearLayout.LayoutParams sp = Ui.wrap();
         sp.topMargin = dp(2);
         info.addView(st, sp);
         top.addView(info, Ui.weight());
         top.addView(Ui.more(this, "Manage " + g.name, v -> manage(g)));
         c.addView(top);
-        Ui.Action play = Ui.action(this, R.drawable.ic_play, "Play", Ui.Kind.PRIMARY, v -> launch(g));
+        Ui.Action play = other
+                ? Ui.action(this, R.drawable.ic_build, "Diagnostics", Ui.Kind.TONAL, v -> experimentalDiagnostics(g))
+                : Ui.action(this, R.drawable.ic_play, "Play", Ui.Kind.PRIMARY, v -> launch(g));
         Ui.add(c, play, 16);
         if (!other) check(g, st, play, info);
         c.setOnLongClickListener(v -> { manage(g); return true; });
@@ -425,7 +433,12 @@ public final class MainActivity extends Activity {
         String lp = Pack.libraryProblem(new File(g.packDir), g.titleId);
         String noProfile = Profile.missing(g.titleId, g.name);
         AlertDialog[] d = new AlertDialog[1];
-        if (noProfile != null) Ui.add(box, Ui.small(this, noProfile), 0);
+        if (noProfile != null) {
+            Ui.add(box, Ui.small(this, "Experimental title: you can keep this game in your library and inspect its files, but this APK has no compiled host for it."), 0);
+            Ui.add(box, new Ui.Setting(this, "🔬", "Experimental diagnostics", v -> {
+                d[0].dismiss(); experimentalDiagnostics(g);
+            }).value("Title ID, pack and missing native support").chevron(this).view, 8);
+        }
         // Saves: backups in <Switch2>/save-backups/<id>/, verified; a restore backs up the current save first (SaveUi, SaveStore)
         if (noProfile == null) Ui.add(box, new Ui.Setting(this, "⚙️", "Game settings", v -> { d[0].dismiss(); GameSettings.dialog(this, g); }).chevron(this).view, 0);
         Ui.add(box, new Ui.Setting(this, "📁", "Folders", v -> { d[0].dismiss(); Folders.dialog(this, g); }).chevron(this).view, 0);
@@ -435,7 +448,8 @@ public final class MainActivity extends Activity {
         if (Ondevice.isDump(new File(g.gameDir)) && noProfile == null)
             Ui.add(box, new Ui.Setting(this, "🔁", "Prepare again", v -> { d[0].dismiss(); Ondevice.prepare(this, new File(g.gameDir), true); }).value("Remakes what does not fit").chevron(this).view, 0);
         // The pack as one .zip, out and in (PackUi, PackZip): an import goes into the app's packs/<id> and is checked before it replaces anything
-        Ui.add(box, new Ui.Setting(this, "📦", "Export pack…", v -> { d[0].dismiss(); PackUi.exportPick(this, g); }).value("One .zip, into a folder you pick").chevron(this).view, 0);
+        if (new File(g.packDir, "pack.tsv").isFile())
+            Ui.add(box, new Ui.Setting(this, "📦", "Export pack…", v -> { d[0].dismiss(); PackUi.exportPick(this, g); }).value("One .zip, into a folder you pick").chevron(this).view, 0);
         if (noProfile == null)
             Ui.add(box, new Ui.Setting(this, "📲", "Import pack…", v -> { d[0].dismiss(); PackUi.importPick(this, g); }).value("A .zip or a pack folder").chevron(this).view, 0);
         Ui.add(box, new Ui.Setting(this, "📨", "Share log", v -> { d[0].dismiss(); shareLog(g.titleId); }).chevron(this).view, 0);
@@ -545,8 +559,8 @@ public final class MainActivity extends Activity {
     /** What the background check of Add game found for one game */
     private static final class Pick {
         final File game;
-        String id, name, error;   // error: why it cannot be added (unreadable, no profile in this APK), in a sentence
-        boolean unsupported;      // no profile in this APK
+        String id, name, error;   // error: why the game file could not be identified or read
+        boolean unsupported;      // no compiled host profile: add as an experimental library entry
         boolean dump;             // a dump Prepare starts from (Pack.isDump)
         PackFind.Found pack;      // a pack that plays now or after the automatic shader update (Folders.find), null: none
 
@@ -570,9 +584,15 @@ public final class MainActivity extends Activity {
                 out.add(k);
                 if (Nup.wrongCase(g)) { k.error = g.getName() + ": rename it so that its name ends in \".nup\" (lower case)."; continue; }
                 try { k.id = Pack.titleIdOf(g); } catch (IOException e) { k.error = e.getMessage(); continue; }
-                String why = Profile.missing(k.id, single ? "This game" : g.getName());
-                if (why != null) { k.unsupported = true; k.error = why; continue; }
-                k.name = Profile.of(k.id).name;
+                Profile prof = Profile.of(k.id);
+                if (prof == null) {
+                    k.unsupported = true;
+                    k.name = experimentalName(g);
+                    k.dump = Pack.isDump(g);
+                    android.util.Log.i("nxnative", "Experimental game detected: " + k.name + " (" + k.id + "), native host not compiled");
+                    continue; // no PackCheck / Prepare without a matching native host
+                }
+                k.name = prof.name;
                 k.dump = Pack.isDump(g);
                 String pp = Folders.pickedPack(this, k.id);
                 File pd = pp == null ? null : new File(pp);
@@ -588,6 +608,16 @@ public final class MainActivity extends Activity {
         if (single) {
             Pick k = picks.get(0);
             if (k.error != null) { error(k.error); return; }
+            if (k.unsupported) {
+                new AlertDialog.Builder(this).setTitle("Add experimental game?")
+                        .setMessage(k.name + "\nTitle ID: " + k.id
+                                + "\n\nThis APK has no native host/profile for this game. You can add it to the library, inspect its files and copy a diagnostic report, but it cannot launch or be prepared yet. Nothing will be changed in the game files.")
+                        .setPositiveButton("Add to library", (d, w) -> {
+                            cardFor(k.game, k.id, k.name);
+                            Toast.makeText(this, "Experimental game added: open Diagnostics on its card.", Toast.LENGTH_LONG).show();
+                        }).setNegativeButton("Cancel", null).show();
+                return;
+            }
             if (k.pack != null) { addWithPack(k.game, k.id, k.pack.dir); return; }
             if (k.dump) { Ondevice.prepare(this, k.game, false); return; }
             pendingGame = k.game;
@@ -598,9 +628,9 @@ public final class MainActivity extends Activity {
                     .setNegativeButton("Cancel", null).show();
             return;
         }
-        List<String> ok = new ArrayList<>(), unsupported = new ArrayList<>(), prepare = new ArrayList<>(), noPack = new ArrayList<>(), failed = new ArrayList<>();
+        List<String> ok = new ArrayList<>(), experimental = new ArrayList<>(), prepare = new ArrayList<>(), noPack = new ArrayList<>(), failed = new ArrayList<>();
         for (Pick k : picks) {
-            if (k.unsupported) { unsupported.add(k.game.getName() + " (" + k.id + ")"); continue; }
+            if (k.unsupported) { cardFor(k.game, k.id, k.name); experimental.add(k.name + " (" + k.id + ")"); continue; }
             if (k.error != null) { failed.add(k.error); continue; }
             if (k.pack != null) {
                 String err = add(k.game, k.id, k.pack.dir);
@@ -616,13 +646,13 @@ public final class MainActivity extends Activity {
         if (!ok.isEmpty()) m.append("Added: ").append(TextUtils.join(", ", ok)).append(".");
         if (!prepare.isEmpty()) m.append(m.length() > 0 ? "\n\n" : "").append("Needs Prepare: ").append(TextUtils.join(", ", prepare))
                 .append(". No pack that fits was found: its card's Prepare makes one on this phone (one game at a time).");
-        if (!unsupported.isEmpty()) m.append(m.length() > 0 ? "\n\n" : "").append("Not supported by this app: ").append(TextUtils.join(", ", unsupported))
-                .append(". This app runs: ").append(TextUtils.join(", ", profileIds())).append(".");
+        if (!experimental.isEmpty()) m.append(m.length() > 0 ? "\n\n" : "").append("Added for experimental diagnostics (no compiled native host): ")
+                .append(TextUtils.join(", ", experimental)).append(". Use each game's Diagnostics button to inspect it.");
         if (!noPack.isEmpty()) m.append(m.length() > 0 ? "\n\n" : "").append("No pack found: ").append(TextUtils.join(", ", noPack))
                 .append(". Add it on its own to pick its pack folder.");
         if (!failed.isEmpty()) m.append(m.length() > 0 ? "\n\n" : "").append("Not added: ").append(TextUtils.join(" ", failed));
         android.util.Log.i("nxnative", "Add game: " + m.toString().replace("\n\n", " | "));
-        new AlertDialog.Builder(this).setTitle(ok.isEmpty() && prepare.isEmpty() ? "No game added" : "Games added").setMessage(m).setPositiveButton("OK", null).show();
+        new AlertDialog.Builder(this).setTitle(ok.isEmpty() && prepare.isEmpty() && experimental.isEmpty() ? "No game added" : "Games added").setMessage(m).setPositiveButton("OK", null).show();
     }
 
     private static List<String> profileIds() {
@@ -635,11 +665,13 @@ public final class MainActivity extends Activity {
      * The list entry of a game, made when it has none: a game that still needs its pack gets a card whose pack folder is the app's packs/&lt;id&gt;, where Prepare
      * and Import pack… put it (the card says "Needs preparing" and its button prepares). An existing entry of the same game path is kept as it is
      */
-    Game cardFor(File game, String id) {
+    Game cardFor(File game, String id) { return cardFor(game, id, null); }
+    Game cardFor(File game, String id, String experimentalName) {
         List<Game> list = Game.load(this);
         for (Game g : list) if (g.gameDir.equals(game.getPath())) return g;
         Profile p = Profile.of(id);
-        Game g = new Game(id, p == null ? id : p.name, game.getPath(), AppStorage.pack(this, id).getPath());
+        String name = p != null ? p.name : experimentalName != null ? experimentalName : experimentalName(game);
+        Game g = new Game(id, name, game.getPath(), AppStorage.pack(this, id).getPath());
         list.add(g);
         Game.save(this, list);
         refresh();
