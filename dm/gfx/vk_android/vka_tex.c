@@ -482,13 +482,21 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     // takes views of its own format only
     // DM_VK_UBWC=0: every colour image MUTABLE_FORMAT without a list, as before (any view format; no UBWC on Adreno)
     int ubwc = VKA_ENV("DM_VK_UBWC", 1);   // live: images made from now on
-    VkFormat alt = f->kind == 0 && srgb_twin(f->vk) != f->vk ? srgb_twin(f->vk) : VK_FORMAT_UNDEFINED;
+    // The translated FETCH1D shaders use floating-point sampled-image
+    // descriptors even when the source NVN buffer is R32_UINT. A float view
+    // over the same four bytes preserves the bit pattern (the shader reinterprets
+    // fetched values); a plain R32_UINT view cannot be bound to that descriptor.
+    // Only the opt-in buffer-as-2D representation needs this mutable pair.
+    int tbuf_bits = d->target == NVN_TEXTURE_TARGET_BUFFER &&
+                    VKA_ENV("DM_VK_TBUF_2D", 0) && f->vk == VK_FORMAT_R32_UINT;
+    VkFormat alt = tbuf_bits ? VK_FORMAT_R32_SFLOAT :
+                   f->kind == 0 && srgb_twin(f->vk) != f->vk ? srgb_twin(f->vk) : VK_FORMAT_UNDEFINED;
     VkFormat fls[6] = {f->vk, alt}; int nfl = 2;
     if (ubwc && f->kind == 0) { pthread_mutex_lock(&g_vlmu); im->nx = vl_formats(f->vk, im->w, im->h, im->xfmt, VL_PER_IMAGE); pthread_mutex_unlock(&g_vlmu); for (int k = 0; k < im->nx; k++) fls[nfl++] = im->xfmt[k]; }   // learned view formats
     if (!alt && im->nx) fls[1] = fls[--nfl];   // (no sRGB twin: no UNDEFINED entry in the list)
     VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = (uint32_t)nfl, .pViewFormats = fls};
     VkImageCreateFlags fl = alt || im->nx || (!ubwc && f->kind == 0) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-    im->alt = ubwc ? alt : VK_FORMAT_UNDEFINED; im->any_fmt = !ubwc && f->kind == 0;
+    im->alt = (ubwc || tbuf_bits) ? alt : VK_FORMAT_UNDEFINED; im->any_fmt = !ubwc && f->kind == 0;
     if (!res && !is3d && !is1d && im->w == im->h && im->layers >= 6 && im->layers % 6 == 0 && im->samples == 1) fl |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     uint32_t rtw = 0, rth = 0, rtd = 0; int ntl = res ? nvn_tex_sparse_tiles(d, &rtw, &rth, &rtd) : 0;
     if (res) {   // the format takes sparse residency at this shape, with the usage it would have (storage use dropped: sampled sparse textures have none)
@@ -1707,7 +1715,12 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
     } else if (vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_2D) na = 1;
     else if (vt == VK_IMAGE_VIEW_TYPE_3D) { a0 = 0; na = 1; }
     VkImageAspectFlags asp = im->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : e->t.stencil || (v && v->set_dsmode && v->dsmode) ? VK_IMAGE_ASPECT_STENCIL_BIT : im->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_STENCIL_BIT;
-    return vka_view(im, e->img || storage ? f.vk : f.view, vt, asp, l0, nl, a0, na, storage ? NULL : &m);
+    VkFormat want_fmt = e->img || storage ? f.vk : f.view;
+    if (!storage && vt == VK_IMAGE_VIEW_TYPE_2D &&
+        im->d.target == NVN_TEXTURE_TARGET_BUFFER && VKA_ENV("DM_VK_TBUF_2D", 0) &&
+        im->f.vk == VK_FORMAT_R32_UINT && want_fmt == VK_FORMAT_R32_UINT)
+        want_fmt = VK_FORMAT_R32_SFLOAT; // preserve UINT texel bits for a float-sampled shader
+    return vka_view(im, want_fmt, vt, asp, l0, nl, a0, na, storage ? NULL : &m);
 }
 
 // DM_VK_IMG_UPGRADE=0: no image intent from a binding: made and kept without storage use, the binding reads as unbound (as before); live
@@ -1864,7 +1877,14 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     if (!storage && !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return VK_NULL_HANDLE;
     // The sampled type must be the image format's class (float / sint / uint): another class is undefined in Vulkan
     int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = im->f.kind == 1 ? 1 : im->f.kind == 2 ? 2 : 0;
-    if (want != have && !(im->f.kind >= 3 && want == 0)) return VK_NULL_HANDLE;
+    // FETCH1D's translated shader declares an image2D<float>, while NVN
+    // registers its raw 32-bit lookup buffer as R32_UINT. The mutable float
+    // view above is format-class compatible with that shader and preserves
+    // the underlying integer bits. Do not relax validation for other textures.
+    int tbuf_float_bits = !storage && VKA_ENV("DM_VK_TBUF_2D", 0) &&
+        im->d.target == NVN_TEXTURE_TARGET_BUFFER && im->f.vk == VK_FORMAT_R32_UINT &&
+        want == 0 && have == 1 && (dim & DMSH_VK_DIM_MASK) == 1;
+    if (want != have && !(im->f.kind >= 3 && want == 0) && !tbuf_float_bits) return VK_NULL_HANDLE;
     if (imo) *imo = im;
     VkImageView view = view_of(&e, im, vt, storage);
     if (!view && VKA_ENV("DM_VK_TEX_TRACE", 0)) {
