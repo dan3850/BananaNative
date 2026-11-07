@@ -659,6 +659,29 @@ static int storage_mode(const tex_t *t, const uint8_t *c, const vka_fmt *f, int 
         if (any && k < 4) VLOG("texture serial %llu %ux%ux%u format %#x pool flags %#x: written by the CPU before its first use, a sample (NVN2): uploaded from its storage, re-uploaded when it changes (%llu so far, %llu more with empty storage)",
                                (unsigned long long)t->serial, d->width, d->height, d->depth, d->format, pf, (unsigned long long)k + 1, (unsigned long long)g_nvn2_first[1]);
     }
+    else if (VKA_ENV("DM_VK_SKY_SEED_SMALL", 0) && sampled &&
+             d->target == NVN_TEXTURE_TARGET_2D && d->height == 1 &&
+             ((d->width == 4 && d->format == 0x0a) ||
+              (d->width == 2 && d->format == 0x2e)) &&
+             t->L.size <= 256 &&
+             (d->flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE)) ==
+                 (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_COMPRESSIBLE) &&
+             !(pf & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) &&
+             !gpu_image_over(t->mem) && mem_any_mapped(c, t)) {
+        // Pokopia: DM_VK_ZEROLOG found two sampled GPU-capable tiny images
+        // (4x1 R32F and 2x1 RGBA32F) with actual guest storage, but ST_ZERO
+        // cleared them on their first sample. Preserve the original default:
+        // the opt-in trial uploads that authoritative initial content and
+        // follows subsequent CPU changes instead. Do not include nonsampled
+        // targets (the 256x3 candidates), or resources already backed by a
+        // live GPU-written Vulkan image.
+        want = ST_TRACK;
+        static _Atomic unsigned seeded;
+        if (atomic_fetch_add(&seeded, 1) < 16)
+            VLOG("sky-seed-small serial=%llu %ux%u format=%#x bytes=%llu sampled=%d poolflags=%#x: initial guest data uploaded instead of cleared",
+                (unsigned long long)t->serial, d->width, d->height, d->format,
+                (unsigned long long)t->L.size, sampled, pf);
+    }
     else if (!(d->flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && t->pool && ((pf & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED)) || nvn_flushed(t->mem, t->L.size))
              && mem_any_mapped(c, t)) want = ST_FILL;
     // No later CPU writes to follow: a pool the CPU cannot access, a virtual pool (its pages are not the storage's), storage outside every tracked pool, or tracking off
