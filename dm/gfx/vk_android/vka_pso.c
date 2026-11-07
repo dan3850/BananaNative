@@ -919,16 +919,16 @@ void vka_pso_promote_shader(uint64_t key) {
     if (!key || strcmp(DM_GAME_ID, "0400A3A01EE4C000")) return;
     const char *off = getenv("DM_VK_PREWARM_PROMOTE");
     if (off && !strcmp(off, "0")) return;  // A/B without changing the APK
+    uint32_t moved = 0;
     pthread_mutex_lock(&g_pw_qmu);
     if (!g_pw_order) g_pw_early[g_pw_early_n++ % PW_EARLY_KEYS] = key;
-    else {
-        uint32_t moved = pw_promote_locked(key);
-        static _Atomic uint32_t logged;
-        if (moved && atomic_fetch_add(&logged, 1) < 8)
-            VLOG("Pokopia prewarm: shader %016llx moved %u known graphics pipelines ahead of FIFO",
-                 (unsigned long long)key, moved);
-    }
+    else moved = pw_promote_locked(key);
     pthread_mutex_unlock(&g_pw_qmu);
+    // Do not take the logging lock while holding the scheduling mutex.
+    static _Atomic uint32_t logged;
+    if (moved && atomic_fetch_add(&logged, 1) < 8)
+        VLOG("Pokopia prewarm: shader %016llx moved %u known graphics pipelines ahead of FIFO",
+             (unsigned long long)key, moved);
 }
 static int pw_queue_init(void) {
     uint32_t n = g_pw_load_n;
