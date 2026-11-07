@@ -125,7 +125,7 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
 // ---------- The pipeline cache ----------
 // DM_VK_PCACHE (restart): unset = $DM_TEMP/vk_pipelines[-<driver>].bin; a path = that file; 0 = no file (the run starts empty and keeps nothing: a cold run). Before 2026-11-03 "0"
 // was taken as a file named 0 in the working folder, so a second "cold" run read the first one's pipelines back (stutter-agent cold2gpl: 10 MB read, warm)
-static VkPipelineCache g_pc; static char g_pc_path[1024], g_pw_path[1100]; static uint64_t g_made, g_saved_at, g_save_ns; static double g_create_ms;
+static VkPipelineCache g_pc; static char g_pc_path[1024], g_pw_path[1100], g_pw_seed_path[1100]; static uint64_t g_made, g_saved_at, g_save_ns; static double g_create_ms;
 static uint64_t g_ngfx, g_ncs, g_nfail, g_ncs_over, g_create_ns, g_frame_made;   // all pipelines made (frame path, background and prewarm); g_frame_made / g_create_ns: on the frame path only
 static uint64_t g_probe_hit, g_probe_miss, g_probe_miss_ns;          // GPL: the cache-only try before a link (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
 static _Atomic uint64_t g_save_ns_total, g_hy_draws, g_pw_wait_ns;
@@ -163,6 +163,15 @@ static void pc_open_once(void) {
     if (r) { g_pc = VK_NULL_HANDLE; VRED("vkCreatePipelineCache %d: pipelines are built without a cache", r); }
     else VLOG("pipeline cache %s: %zu bytes read", g_pc_path[0] ? g_pc_path : e && !strcmp(e, "0") ? "(none: DM_VK_PCACHE=0)" : "(not kept: no DM_TEMP or HOME)", n);
     free(data);
+    // Persistent, shader-pack-side pipeline-key seed. The actual VkPipelineCache
+    // stays private to the Android app/driver; only replayable shader+state keys
+    // are mirrored here. Clearing app data must not discard the game's manifest.
+    // The ordinary app-local key file always wins if it exists.
+    if (!strcmp(DM_GAME_ID, "0400A3A01EE4C000")) {
+        const char *pack = dm_module_dir();
+        if (pack && *pack && snprintf(g_pw_seed_path, sizeof g_pw_seed_path, "%s/pso_pokopia.keys", pack) >= (int)sizeof g_pw_seed_path)
+            g_pw_seed_path[0] = 0;
+    }
     pw_load();
     pthread_t th;
     if (!pthread_create(&th, NULL, saver_main, NULL)) { pthread_detach(th); g_sv_up = 1; }
@@ -427,7 +436,21 @@ static uint64_t g_nlib[NLIB], g_nlinked, g_nopt; static double g_lib_ms, g_link_
 static const char *const g_lib_name[NLIB] = {"vertex input", "pre-rasterization", "fragment shader", "fragment output", "pre-rasterization + fragment shader"};
 enum { A_NOCACHE = 1, A_RETAIN = 2, A_NORI = 4, A_COMBINED = 8 };
 static unsigned g_pre_adapt; static int g_pre_probed, g_pre_refused; static _Atomic int g_gpl_off;
-static int gpl_on(void) { return V.gpl && !atomic_load(&g_gpl_off); }
+static int gpl_on(void) {
+    if (!V.gpl || atomic_load(&g_gpl_off)) return 0;
+    // Qualcomm's proprietary Adreno 840 driver build 0x8034a02c repeatedly
+    // returned VK_ERROR_UNKNOWN (-13) for *every* pre-rasterization library
+    // in prior experiments. Avoid three knowingly doomed synchronous attempts
+    // on the first cold frames. Do not penalize Turnip or future driver builds.
+    if (!strcmp(DM_GAME_ID, "0400A3A01EE4C000") &&
+        V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
+        V.props.driverVersion == 0x8034a02c &&
+        !VKA_ENV("DM_VK_GPL_RETRY_ADRENO", 0)) {
+        VRED_ONCE("Pokopia: GPL disabled for Adreno 840 driver 0x8034a02c (pre-raster libraries returned -13); full pipelines and prewarm remain enabled");
+        return 0;
+    }
+    return 1;
+}
 static VkPipeline lib_make(int kind, const void *key, size_t klen, VkGraphicsPipelineCreateInfo *ci, VkGraphicsPipelineLibraryFlagsEXT part, int *refused) {
     uint64_t h = fnv(key, klen, 1469598103934665603ull);
     pthread_mutex_lock(&g_mu); void *hit = km_get(&g_lib[kind], key, h); pthread_mutex_unlock(&g_mu);
@@ -701,7 +724,13 @@ static void pw_note(int kind, vka_shader *const sh[5], const void *kb, uint32_t 
 }
 static void pw_load(void) {
     if (!g_pw_path[0]) return;
-    FILE *f = fopen(g_pw_path, "rb"); if (!f) { VLOG("prewarm list %s: none yet (written as this run makes pipelines)", g_pw_path); return; }
+    FILE *f = fopen(g_pw_path, "rb");
+    int from_seed = 0;
+    if (!f && g_pw_seed_path[0]) {
+        f = fopen(g_pw_seed_path, "rb");
+        if (f) { from_seed = 1; VLOG("prewarm: restoring pipeline keys from persistent Pokopia pack manifest %s", g_pw_seed_path); }
+    }
+    if (!f) { VLOG("prewarm list %s: none yet (written as this run makes pipelines)", g_pw_path); return; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t *d = sz > (long)sizeof(pwhdr) ? malloc((size_t)sz) : NULL;
     int ok = d && fread(d, 1, (size_t)sz, f) == (size_t)sz; fclose(f);
@@ -722,9 +751,10 @@ static void pw_load(void) {
     }
     if (skipped) VLOG("prewarm list %s: %u records with impossible values skipped (dropped at the next save)", g_pw_path, skipped);
     g_pw_load = malloc(g_pw_len ? g_pw_len : 1); if (g_pw_load) { memcpy(g_pw_load, g_pw_buf, g_pw_len); g_pw_load_len = g_pw_len; g_pw_load_n = g_pw_n; }
+    if (from_seed && g_pw_load_n) g_pw_dirty = 1;   // mirror the verified seed back to the app's private list on the next save
     pthread_mutex_unlock(&g_pw_mu);
     free(d);
-    VLOG("prewarm list %s: %u pipeline keys of earlier runs", g_pw_path, g_pw_load_n);
+    VLOG("prewarm list %s: %u pipeline keys of earlier runs%s", from_seed ? g_pw_seed_path : g_pw_path, g_pw_load_n, from_seed ? " (persistent manifest)" : "");
 }
 static int pw_save(void) {   // the saver thread or a forced save: the list when it changed; -1 = not written
     if (!g_pw_path[0]) return 0;
@@ -745,6 +775,23 @@ static int pw_save(void) {   // the saver thread or a forced save: the list when
     FILE *f = fopen(tmp, "wb");
     int ok = f && fwrite(out, 1, sizeof h + len, f) == sizeof h + len && !fclose(f) && !rename(tmp, g_pw_path);
     if (!ok) { if (f) fclose(f); unlink(tmp); static _Atomic int k; if (atomic_fetch_add(&k, 1) < 2) VRED("prewarm list not written to %s", g_pw_path); pthread_mutex_lock(&g_pw_mu); g_pw_dirty = 1; pthread_mutex_unlock(&g_pw_mu); }
+    // An NXVKPW2 manifest can outlive Clear data because it lives alongside
+    // the user's pack (not in Android/data). Keep the old seed intact unless
+    // the new file was written in full. If the pack is read-only, the normal
+    // app-local save still succeeds, and the failure is logged only once.
+    if (ok && g_pw_seed_path[0]) {
+        char seedtmp[1200];
+        if (snprintf(seedtmp, sizeof seedtmp, "%s.tmp", g_pw_seed_path) < (int)sizeof seedtmp) {
+            FILE *sf = fopen(seedtmp, "wb");
+            if (sf) {
+                size_t need = sizeof h + len, wrote = fwrite(out, 1, need, sf);
+                int closed = fclose(sf);
+                if (wrote == need && !closed && !rename(seedtmp, g_pw_seed_path))
+                    VLOG("Pokopia persistent pipeline manifest: %u keys saved to %s (survives Clear data)", n, g_pw_seed_path);
+                else { unlink(seedtmp); VRED_ONCE("Pokopia persistent pipeline manifest not saved at %s (app-local key cache still saved)", g_pw_seed_path); }
+            } else VRED_ONCE("Pokopia persistent pipeline manifest is not writable at %s (app-local key cache still saved)", g_pw_seed_path);
+        }
+    }
     free(out);
     return ok ? (int)n : -1;
 }
