@@ -43,6 +43,8 @@ int vka_pools(uint64_t *lo, uint64_t *size, int max);
 uint64_t vka_frame(void);
 void nvn_prog_keys_set(const prog_t *p, const uint8_t key[6][8], uint8_t ok);
 void nvn_dpool_base_set(const void *pool, int tex_base, int samp_base);
+// hle_nvn.c: live memory-pool generation (0 if finalized) and its flags/sparse state.
+uint64_t nvn_pool_live(const void *pool, unsigned *flags, int *sparse);
 int nvn_host_readable(uint64_t a, uint64_t n);
 int nvn_dpool_base(const void *pool, int tex);
 void nvn_ft_poll(void);
