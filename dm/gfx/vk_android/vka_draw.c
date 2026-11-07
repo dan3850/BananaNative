@@ -1298,13 +1298,20 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     PT(3);
     if (!mesh) vin_build(d, sh[0], &k);
     PT(4);
-    // The async graphics experiment is opt-in. Never defer a draw that could
-    // write guest memory, depth or stencil, and keep the known Pokopia sky
-    // shaders synchronous to preserve the already-correct background.
-    // Other eligible draws may briefly pop in: DM_VK_GFX_ASYNC=0 restores the
-    // original fully synchronous behaviour without an APK rebuild.
+    // Automatic for Pokopia on the specific Qualcomm Adreno driver verified
+    // by a user playtest (driver version 0x8034a02c); other drivers still
+    // default to synchronous graphics until tested. The per-game environment
+    // switch overrides the automatic choice: DM_VK_GFX_ASYNC=0 restores the
+    // synchronous path without rebuilding or clearing any cache.
+    // Never defer a draw that could write guest memory, depth or stencil,
+    // or uses one of the shaders needed to keep the Pokopia sky correct.
     int gfx_async_safe = 0;
-    if (!strcmp(DM_GAME_ID, "0400A3A01EE4C000") && VKA_ENV("DM_VK_GFX_ASYNC", 0)) {
+    int pokopia_graphics = !strcmp(DM_GAME_ID, "0400A3A01EE4C000");
+    int async_auto = pokopia_graphics &&
+                     V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
+                     V.props.driverVersion == 0x8034a02c;
+    int async_enabled = pokopia_graphics && VKA_ENV("DM_VK_GFX_ASYNC", async_auto);
+    if (async_enabled) {
         uint64_t fskey = sh[1] ? sh[1]->key : 0;
         int sky_shader = fskey == 0xa1d74f08252ddd39ull || fskey == 0xecf791af5d66d04eull ||
                          fskey == 0x8743dd823fc8e863ull || fskey == 0xcb656dd5c9a8bc81ull ||
