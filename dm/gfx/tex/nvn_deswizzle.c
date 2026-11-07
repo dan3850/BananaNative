@@ -45,12 +45,27 @@ int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
     return 0;
 }
 
-static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin, size_t pitch, int to_linear, uint32_t y0, uint32_t y1) {
-    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
-    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+// The Vulkan upload workers decode many 64 KiB row slices from the same
+// texture level. Preparing geometry per slice repeatedly rebuilt the whole
+// texture layout on every worker, which is unnecessary CPU work.
+int nvn_deswizzle_prepare(const nvn_texdesc *d, unsigned level, unsigned layer, nvn_deswizzle_ctx *ctx) {
+    if (!ctx) return -1;
+    uint32_t bpb;
+    if (nvn_deswizzle_geom(d, level, layer, &ctx->row_bytes, &ctx->rows, &ctx->slices,
+                           &ctx->base, &ctx->tile_h, &ctx->tile_d, &bpb)) return -1;
+    ctx->laid_out_bytes = nvn_tex_level_gobs(d, level) * 64;
+    if (ctx->laid_out_bytes < ctx->row_bytes) ctx->laid_out_bytes = ctx->row_bytes;
+    ctx->switch2 = nvn_gob_switch2 != 0;
+    return 0;
+}
+static int move_prepared(const nvn_deswizzle_ctx *ctx, uint8_t *bl, uint8_t *lin, size_t pitch,
+                         int to_linear, uint32_t y0, uint32_t y1) {
+    uint32_t row_bytes = ctx->row_bytes, rows = ctx->rows, slices = ctx->slices;
+    uint64_t base = ctx->base;
+    unsigned th = ctx->tile_h, td = ctx->tile_d;
     if (pitch < row_bytes) return -1;
-    bl += base; uint32_t lb = nvn_tex_level_gobs(d, level) * 64;   // the row as laid out (padded in a sparse texture's tiled levels)
-    if (lb < row_bytes) lb = row_bytes;
+    bl += base;
+    uint32_t lb = ctx->laid_out_bytes;
     // Hoist nvn_bl_offset's slice and row terms out of the segment loop. The block height and depth are powers of two,
     // so their division / remainder become shifts and masks. At x = 16*j the block column is j >> 2, and the segment
     // has one of four positions inside the GOB (x%64 = 0/16/32/48 -> 0/32/256/288); the y part depends only on y%8.
@@ -58,7 +73,7 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     static const uint16_t koy1[8] = {0, 16, 64, 80, 128, 144, 192, 208};      // (y%8/2)*64 + (y%2)*16
     static const uint16_t kox2[4] = {0, 64, 256, 320};                        // the Switch 2's order (gob_off): x%32/16 at 64
     static const uint16_t koy2[8] = {0, 16, 32, 48, 128, 144, 160, 176};      // (y%8/4)*128 + (y%4/2)*32 + (y%2)*16
-    const uint16_t *kox = nvn_gob_switch2 ? kox2 : kox1, *koy = nvn_gob_switch2 ? koy2 : koy1;
+    const uint16_t *kox = ctx->switch2 ? kox2 : kox1, *koy = ctx->switch2 ? koy2 : koy1;
     uint32_t bh = 1u << th, bd = 1u << td;
     uint64_t block = 512ull * bh * bd, gobs_x = (uint64_t)(lb + 63) >> 6, blocks_y = ((uint64_t)rows + 8 * bh - 1) >> (3 + th);
     for (uint32_t z = 0; z < slices; z++) {
@@ -82,6 +97,16 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     return 0;
 }
 
+static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin,
+                size_t pitch, int to_linear, uint32_t y0, uint32_t y1) {
+    nvn_deswizzle_ctx ctx;
+    if (nvn_deswizzle_prepare(d, level, layer, &ctx)) return -1;
+    return move_prepared(&ctx, bl, lin, pitch, to_linear, y0, y1);
+}
+int nvn_deswizzle_rows_prepared(const nvn_deswizzle_ctx *ctx, const void *src, void *dst, size_t pitch,
+                               uint32_t y0, uint32_t y1) {
+    return ctx ? move_prepared(ctx, (uint8_t *)src, (uint8_t *)dst, pitch, 1, y0, y1) : -1;
+}
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
     return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, 0, UINT32_MAX);
 }
