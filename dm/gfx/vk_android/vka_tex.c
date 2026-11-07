@@ -7,6 +7,7 @@
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "../nvn/nvn_mtl.h"
+#include "../nvn/nvn_tex.h"
 #include "../tex/nvn_deswizzle.h"
 #include "../nvn/dmsh_abi_vk.h"
 #include "../nvn/nvn_dirty.h"
@@ -442,12 +443,19 @@ static vka_img *img_create(const tex_t *t, const vka_fmt *f, uint32_t base) {
 // residency at this shape (a dense one may be made)
 static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int res, int *why, uint64_t *need) {
     const nvn_texdesc *d = &t->d;
+    uint32_t bw = 0, bh = 0, br = 0;
     if (d->target == NVN_TEXTURE_TARGET_BUFFER) {
-        // Experimental compatibility for translated shaders declaring these as
-        // sampled 2D images. NVN buffer textures have tightly packed texels.
-        // Keep the previous behavior unless explicitly enabled.
-        if (!VKA_ENV("DM_VK_TBUF_2D", 0) || !t->L.bpb || !d->width || d->height > 1 || d->levels > 1 || d->width > 16384) {
-            VRED_ONCE("texture buffers are not images yet (first: serial %llu)", (unsigned long long)t->serial);
+        // DMSH_VK_BF_FETCH1D: the translated shader fetches 1D texels as
+        // texelFetch(image2D, ivec2(index & 16383, index >> 14), 0).
+        // nvn_tbuf_rows is also used by the native Metal replay. The earlier
+        // experiment made a single row and rejected every buffer >16384.
+        if (!VKA_ENV("DM_VK_TBUF_2D", 0) || !t->L.bpb ||
+            t->L.bpb != f->bpb || f->bw != 1 || f->bh != 1 ||
+            !d->width || d->height > 1 || d->levels > 1 ||
+            !nvn_tbuf_rows(d->width, t->L.bpb, 1, &bw, &bh, &br) ||
+            bw > V.props.limits.maxImageDimension2D || bh > V.props.limits.maxImageDimension2D ||
+            t->L.size < (uint64_t)d->width * t->L.bpb) {
+            VRED_ONCE("texture buffer 2D rows refused (first: serial %llu)", (unsigned long long)t->serial);
             return NULL;
         }
     }
@@ -458,7 +466,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     // 1D and 1D-array textures are one-row 2D / 2D-array images, as nvn_mtl.m makes them: the translator declares every such read as a 2D one (no Dim1D in any DKB module),
     // and Vulkan has no 2D view of a 1D image, so a 1D image read as unbound
     int is3d = d->target == NVN_TEXTURE_TARGET_3D, is1d = d->target == NVN_TEXTURE_TARGET_1D || d->target == NVN_TEXTURE_TARGET_1D_ARRAY || d->target == NVN_TEXTURE_TARGET_BUFFER;
-    im->w = d->width ? d->width : 1; im->h = is1d ? 1 : d->height ? d->height : 1; im->depth = is3d ? (d->depth ? d->depth : 1) : 1;
+    im->w = bw ? bw : d->width ? d->width : 1; im->h = bh ? bh : is1d ? 1 : d->height ? d->height : 1; im->depth = is3d ? (d->depth ? d->depth : 1) : 1;
     im->layers = is3d ? 1 : t->L.layers ? t->L.layers : 1; im->levels = d->levels ? d->levels : 1; im->samples = d->samples > 1 ? (uint32_t)d->samples : 1;
     if (base >= im->levels || is3d) base = 0;
     im->base = base; im->levels -= base; im->w = im->w >> base ? im->w >> base : 1; im->h = im->h >> base ? im->h >> base : 1;
@@ -1421,6 +1429,30 @@ static void upload(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // (call
     atomic_fetch_add_explicit(&g_up_ns, now_ns() - t0, memory_order_relaxed); atomic_fetch_add_explicit(&g_up_bytes, nb, memory_order_relaxed);
 }
 static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *nbytes) {
+    if (t->d.target == NVN_TEXTURE_TARGET_BUFFER) {
+        // NVN buffer texels are tightly packed (no GOB deswizzle). For a
+        // >16384-element buffer the translator expects successive 16384-wide
+        // rows; pad only the final row, never read past the original storage.
+        uint64_t bytes = (uint64_t)im->w * im->h * im->f.bpb;
+        uint64_t srcbytes = (uint64_t)t->d.width * t->L.bpb;
+        if (!t->mem || !cb || !bytes || srcbytes > bytes || srcbytes > t->L.size) return;
+        vka_span staging;
+        if (!vka_scratch(bytes, 16, &staging)) return;
+        memset(staging.ptr, 0, (size_t)bytes);
+        memcpy(staging.ptr, t->mem, (size_t)srcbytes);
+        VkBufferImageCopy cp = {0};
+        cp.bufferOffset = staging.off;
+        cp.imageSubresource = (VkImageSubresourceLayers){im->aspect, 0, 0, 1};
+        cp.imageExtent = (VkExtent3D){im->w, im->h, 1};
+        vk.vkCmdCopyBufferToImage(cb, staging.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        *nbytes = bytes;
+        static _Atomic unsigned n;
+        if (atomic_fetch_add(&n, 1) < 32)
+            VLOG("tbuf2d upload serial=%llu elements=%u packed=%ux%u bytes=%llu (source=%llu)",
+                (unsigned long long)t->serial, t->d.width, im->w, im->h,
+                (unsigned long long)bytes, (unsigned long long)srcbytes);
+        return;
+    }
     if (!im->vpool && upload_mt(im, t, cb, nbytes)) return;   // (a sparse pool's storage is read through its page table below, never at its address)
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
     int linear = d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET), is3d = d->target == NVN_TEXTURE_TARGET_3D;
